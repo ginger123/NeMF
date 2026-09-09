@@ -213,12 +213,35 @@ class Volumes:
         query_points = self.get_coord_grid()
         ext = self.extinctions.reshape(self.extinctions.shape[0],self.extinctions.shape[1], -1)
         # indices = None
-        indices = [torch.arange(ext.shape[-1], device=self.extinctions.device)]
-
-        if masks is not None:
-            ext = [e[:,m.reshape(-1)] if m is not None else e for e, m in zip(ext, masks)]
-            query_points = [points[m.reshape(-1),:] if m is not None else points for points, m in zip(query_points, masks)]
-            indices = [points[m.reshape(-1)] if m is not None else points for points, m in zip(indices, masks)]
+        indices = [torch.arange(ext.shape[-1], device=self.extinctions.device) for _ in ext]
+        if method == 'random_8020mask':
+            gt_masks = [(mask == 1) for mask in masks]
+            envelope_masks = [(mask == 0.5) for mask in masks]
+            air_masks = [(mask == 0) for mask in masks]
+            n_query_list = [(n_query if n_query*0.8<gt_mask.int().sum() else int(gt_mask.int().sum()*100/80)) for gt_mask in gt_masks]
+            if masks is not None:
+                n_gt = [(int(n_query_i*0.8) if n_query*0.8<gt_mask.sum() else int(gt_mask.sum())) for n_query_i,gt_mask in zip(n_query_list,gt_masks)]
+                n_envelope = [int(torch.ceil(torch.tensor((n_query_i-n_gt_i)/2))) for n_query_i,n_gt_i in zip(n_query_list,n_gt)]
+                n_air = [n_query_i-n_gt_i-n_envelope_i for n_query_i, n_gt_i, n_envelope_i in zip(n_query_list, n_gt, n_envelope)]
+                indices_gt = [indice[gt_mask.reshape(-1)] for indice, gt_mask in zip(indices,gt_masks)]
+                indices_envelope = [indice[envelope_mask.reshape(-1)] for indice, envelope_mask in zip(indices, envelope_masks)]
+                indices_air = [indice[air_mask.reshape(-1)] for indice, air_mask in zip(indices,air_masks)]
+                indices_gt = [indice_gt[torch.randperm(indice_gt.shape[0])[:n_gt_i]]
+                              for indice_gt,n_gt_i in zip(indices_gt,n_gt)]
+                indices_envelope = [indice_envelope[torch.randperm(indice_envelope.shape[0])[:n_envelope_i]]
+                                    for indice_envelope,n_envelope_i in zip(indices_envelope,n_envelope)]
+                indices_air = [indice_air[torch.randperm(indice_air.shape[0])[:n_air_i]]
+                               for indice_air,n_air_i in zip(indices_air,n_air)]
+                indices = [torch.cat((indice_gt, indice_envelope, indice_air))
+                           for indice_gt, indice_envelope, indice_air in zip(indices_gt,indices_envelope,indices_air)]
+                ext = [vol[:, index] for vol, index in zip(ext, indices)]
+                query_points = [points[index, :] for points, index in zip(query_points, indices)]
+        else:
+            if masks[0] is not None:
+                masks = [((mask > 0) if mask.dtype != 'bool' else mask) for mask in masks]
+                ext = [e[:,m.reshape(-1)] if m is not None else e for e, m in zip(ext, masks)]
+                query_points = [points[m.reshape(-1),:] if m is not None else points for points, m in zip(query_points, masks)]
+                indices = [points[m.reshape(-1)] if m is not None else points for points, m in zip(indices, masks)]
 
 
         if method == 'topk':
@@ -230,7 +253,8 @@ class Volumes:
             indices = [torch.randperm(e.shape[-1])[:n_query if n_query < e.shape[-1] else e.shape[-1]] for e in ext]
             ext = [vol[:,index] for vol, index in zip(ext, indices)]
             query_points = [points[index, :] for points, index in zip(query_points, indices)]
-
+        elif method == 'random_8020mask':
+            pass
         elif method == 'all':
             pass
             # ext = torch.stack(ext)

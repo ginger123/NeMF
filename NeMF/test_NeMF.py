@@ -82,8 +82,13 @@ def main(cfg: DictConfig):
         cfg=cfg
     )
 
+    # set the number of environment input parameters
+    env_params_num = 0
+    if cfg.ct_net.use_sun_angle:
+        env_params_num = env_params_num + 2
+
     # Initialize the Radiance Field model.
-    model = NeMFnet(cfg=cfg, n_cam=cfg.data.n_cam)
+    model = NeMFnet(cfg=cfg, n_cam=cfg.data.n_cam, env_params_num=env_params_num)
 
     # Load model
     assert os.path.isfile(checkpoint_resume_path)
@@ -120,8 +125,18 @@ def main(cfg: DictConfig):
             print('val {}/{}'.format(val_i,len(val_dataloader)))
             # if (val_dataloader.dataset.cloud_dir[val_i]) != '/wdata/inbalkom/NN_Data/BOMEX_256x256x100_5000CCN_50m_micro_256/new_clouds/test/cloud_results_6065.pkl':
             #     continue
-            val_image, microphysics, grid, image_sizes, projection_matrix, camera_center, masks = val_batch  # [0]#.values()
+            val_image, microphysics, grid, image_sizes, projection_matrix, camera_center, masks, val_env_params = val_batch  # [0]#.values()
             val_image = torch.tensor(val_image, device=device).float()
+            if (not cfg.ct_net.use_sun_angle):
+                val_env_params = None
+            if val_env_params is not None:
+                val_env_params = torch.tensor(val_env_params, device=device).float()
+                if val_env_params[0,0,0] < cfg.data.sun_zenith_threshold:
+                    continue
+                # if cfg.data.env_params_num == 2:  # sun az and zen
+                #     val_env_params = val_env_params[:, :, -2:]
+                # else:
+                #     val_env_params = val_env_params[:, :, :cfg.data.env_params_num]
             val_volume = Volumes(torch.tensor(microphysics, device=device).float(), grid)
 
             val_camera = PerspectiveCameras(image_size=image_sizes,
@@ -154,6 +169,7 @@ def main(cfg: DictConfig):
                         val_image,
                         val_volume,
                         masks,
+                        val_env_params
                     )
                     if val_out['query_indices'] is None:
                         for i, (out_vol, m) in enumerate(zip(val_out["output"], masks)):
@@ -187,7 +203,8 @@ def main(cfg: DictConfig):
                     fn = torch.sum((torch.flatten(gt_mask)) & (est_mask_binary==False))
                     f1_score = 2*tp/(2*tp+fp+fn)
                     F1_score_mat[val_i, thr_ind] = f1_score
-        F1_mean_per_thr = torch.mean(F1_score_mat, dim=0)
+        F1_score_mat_mod = F1_score_mat[F1_score_mat.any(dim=1)]
+        F1_mean_per_thr = torch.mean(F1_score_mat_mod, dim=0)
         MASK_EST_TH = thr_vec[torch.argmax(F1_mean_per_thr)]
     else:
         MASK_EST_TH = 0 #0.2857 #0.2449 #0.5
@@ -247,8 +264,18 @@ def main(cfg: DictConfig):
     test_i = 0
     for test_i, test_batch in enumerate(test_dataloader):
         iteration += 1
-        test_image, microphysics, grid, image_sizes, projection_matrix, camera_center, masks = test_batch  # [0]#.values()
+        test_image, microphysics, grid, image_sizes, projection_matrix, camera_center, masks, test_env_params = test_batch  # [0]#.values()
         test_image = torch.tensor(test_image, device=device).float()
+        if (not cfg.ct_net.use_sun_angle):
+            test_env_params = None
+        if test_env_params is not None:
+            test_env_params = torch.tensor(test_env_params, device=device).float()
+            if test_env_params[0, 0, 0] < cfg.data.sun_zenith_threshold:
+                continue
+            # if cfg.data.env_params_num == 2:  # sun az and zen
+            #     test_env_params = test_env_params[:, :, -2:]
+            # else:
+            #     test_env_params = test_env_params[:, :, :cfg.data.env_params_num]
         test_volume = Volumes(torch.tensor(microphysics, device=device).float(), grid)
 
         test_camera = PerspectiveCameras(image_size=image_sizes, P=torch.tensor(projection_matrix, device=device).float(),
@@ -275,6 +302,7 @@ def main(cfg: DictConfig):
                     test_image,
                     test_volume,
                     masks,
+                    test_env_params
                 )
                 if test_out['query_indices'] is None:
                     for i, (out_vol, m) in enumerate(zip(test_out["output"],masks)):

@@ -152,7 +152,7 @@ class Decoder(nn.Module):
             x = x.reshape(x.shape[0],-1)
         if '3heads_with_mask' in self.type:
             dec0_out = self.decoder0(x)
-            return torch.stack([dec0_out[:,0], torch.sigmoid(dec0_out[:,1]), self.decoder1(x).squeeze(), self.decoder2(x).squeeze()], dim=-1)
+            return torch.stack([dec0_out[:,0], torch.sigmoid(dec0_out[:,1]), self.decoder1(x).squeeze(-1), self.decoder2(x).squeeze(-1)], dim=-1)
         elif '3heads_3out' in self.type:
             return torch.stack([self.decoder0(x),self.decoder1(x),self.decoder2(x)],dim=-1).squeeze()
         elif '1head_with_mask' in self.type:

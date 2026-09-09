@@ -35,13 +35,16 @@ class NeMFnet(torch.nn.Module):
     def __init__(
         self,
         cfg,
-        n_cam
+        n_cam,
+        env_params_num
     ):
         super().__init__()
         n_layers_xyz = cfg.ct_net.n_layers_xyz
         append_xyz = cfg.ct_net.append_xyz
         n_layers_dir = cfg.ct_net.n_layers_dir
         append_dir = cfg.ct_net.append_dir
+        n_layers_env = cfg.ct_net.n_layers_env
+        append_env = cfg.ct_net.append_env
         self.use_neighbours = cfg.ct_net.use_neighbours if hasattr(cfg.ct_net,'use_neighbours') else False
         self._image_encoder = Backbone.from_cfg(cfg)
         self.stop_encoder_grad = cfg.ct_net.stop_encoder_grad
@@ -54,6 +57,8 @@ class NeMFnet(torch.nn.Module):
         self.val_mask_type = None if cfg.ct_net.val_mask_type == 'None' else cfg.ct_net.val_mask_type
         self.decoder_input_size = self._image_encoder.latent_size
         self.data_source = cfg.data.data_source
+        self.env_params_num = env_params_num
+        self.sun_angles_input_model = cfg.ct_net.sun_angles_input_model
         if n_layers_xyz>0:
             if n_layers_xyz>1:
                 self.mlp_xyz = MLPWithInputSkips(
@@ -72,13 +77,22 @@ class NeMFnet(torch.nn.Module):
             self.mlp_xyz = None
         if n_layers_dir>0:
             if n_layers_dir>1:
-                self.mlp_cam_center = MLPWithInputSkips(
-                    n_layers_dir,
-                    3,
-                    3,
-                    cfg.ct_net.n_hidden_neurons_dir,
-                    input_skips=append_dir,
-                )
+                if self.sun_angles_input_model == 'with_cam_centers':
+                    self.mlp_cam_center = MLPWithInputSkips(
+                        n_layers_dir,
+                        6,
+                        6,
+                        cfg.ct_net.n_hidden_neurons_dir,
+                        input_skips=append_dir,
+                    )
+                else:
+                    self.mlp_cam_center = MLPWithInputSkips(
+                        n_layers_dir,
+                        3,
+                        3,
+                        cfg.ct_net.n_hidden_neurons_dir,
+                        input_skips=append_dir,
+                    )
                 self.decoder_input_size += cfg.ct_net.n_hidden_neurons_dir
             else:
                 # insert raw coordinates
@@ -86,6 +100,21 @@ class NeMFnet(torch.nn.Module):
                 self.decoder_input_size += 3
         else:
             self.mlp_cam_center = None
+        if n_layers_env > 0 and self.env_params_num >= 2 and self.sun_angles_input_model == 'separate_mlp':
+            if n_layers_env > 1:
+                self.mlp_env = MLPWithInputSkips(
+                    n_layers_env,
+                    self.env_params_num,
+                    self.env_params_num,
+                    cfg.ct_net.n_hidden_neurons_env,
+                    input_skips=append_env,
+                )
+                self.decoder_input_size += cfg.ct_net.n_hidden_neurons_env
+            else:
+                self.mlp_env = MLPIdentity()
+                self.decoder_input_size += self.env_params_num
+        else:
+            self.mlp_env = None
         self.decoder_input_size *= n_cam
         self.decoder = Decoder.from_cfg(cfg, self.decoder_input_size, self.use_neighbours)
 
@@ -96,6 +125,7 @@ class NeMFnet(torch.nn.Module):
         image: torch.Tensor,
         volume: Volumes,
         masks: torch.Tensor,
+        env_params: torch.Tensor
     ) -> Tuple[dict, dict]:
         """
         Args:
@@ -106,12 +136,18 @@ class NeMFnet(torch.nn.Module):
             ('batch_size', Nx, Ny, Nz).
             masks: A batch of corresponding 3D masks of shape
             ('batch_size', Nx, Ny, Nz).
+            env_params: A batch of corresponding environmental parameters of shape
+            ('batch_size', 'num_cameras', 'env_params_num').
         """
 
         if len(image.shape) == 4:
             image = image[:, :, None, ...]
         Vbatch = len(volume)
         image = image.view(-1, *image.shape[2:])
+        if env_params is not None:
+            env_dim = env_params.shape[0]
+            env_params = env_params.view(-1, *env_params.shape[2:])
+
         image_features = self._image_encoder(image)
         image_features = [features.view(Vbatch,self.n_cam,*features.shape[1:]) for features in image_features]
         del image
@@ -129,15 +165,32 @@ class NeMFnet(torch.nn.Module):
             uv = cameras.project_points_shdom(query_points, screen=True)
         if self.mlp_cam_center:
             cam_centers = cameras.get_camera_center()
-            embed_camera_center = self.mlp_cam_center(cam_centers.view(-1, 3), cam_centers.view(-1, 3)).view(*cam_centers.shape[:-1],-1)
+
+            if self.sun_angles_input_model == 'with_cam_centers':
+                env_params = env_params.squeeze()
+                sun_vec = torch.tensor(
+                    [500.0 * torch.sin(torch.deg2rad(env_params[0])) * torch.cos(torch.deg2rad(env_params[1])),
+                     500.0 * torch.sin(torch.deg2rad(env_params[0])) * torch.sin(torch.deg2rad(env_params[1])),
+                     500.0 * torch.cos(torch.deg2rad(env_params[0]))], device=cam_centers.device)
+                sun_vec = sun_vec.unsqueeze(0).unsqueeze(0).expand(1, 10, -1)  # Shape: (1,10,3)
+                # Concatenate along the last dimension
+                cam_centers = torch.cat((sun_vec, cam_centers), dim=-1)  # Shape: (1,10,6)
+            embed_camera_center = self.mlp_cam_center(cam_centers, cam_centers)
         else:
             embed_camera_center = None
         del cameras
+        del cam_centers
         if self.mlp_xyz:
-            query_points = torch.vstack(query_points).view(-1,3)
-            query_points = self.mlp_xyz(query_points, query_points)
+
+            query_points = torch.vstack(query_points).view(-1,3) #torch.stack(query_points, dim=0) #torch.vstack(query_points).view(-1,3)
+            embed_query_points = self.mlp_xyz(query_points, query_points)
         else:
-            query_points = None
+            embed_query_points = None
+        if self.mlp_env:
+            embed_env_params = self.mlp_env(env_params, env_params).view(*(env_dim, int(env_params.shape[0]/env_dim)),-1)
+        else:
+            embed_env_params = None
+        del env_params
         if self.training:
 
             latent = self._image_encoder.sample_roi(image_features, uv)#.transpose(1, 2)
@@ -146,31 +199,36 @@ class NeMFnet(torch.nn.Module):
                 latent = [lat.detach() for lat in latent]
 
             latent = torch.vstack(latent).transpose(0, 1)
-            if query_points is not None:
-                query_points = query_points.unsqueeze(1).expand(-1,latent.shape[1],-1)
-                latent = torch.cat((latent,query_points),-1)
-                del query_points
+            if embed_query_points is not None:
+                embed_query_points = embed_query_points.unsqueeze(1).expand(-1,latent.shape[1],-1)
+                latent = torch.cat((latent,embed_query_points),-1)
+                del embed_query_points
             if embed_camera_center is not None:
                 latent = torch.split(latent,n_query)
                 latent = torch.vstack([torch.cat((lat,embed.expand(lat.shape[0],-1,-1)),-1) for lat, embed in zip(latent, embed_camera_center)])
                 del embed_camera_center
-				
+            if embed_env_params is not None:
+                embed_env_params = embed_env_params.expand(-1,latent.shape[1],-1)
+                latent = torch.split(latent, n_query)
+                latent = torch.vstack([torch.cat((lat, embed.expand(lat.shape[0], -1, -1)), -1) for lat, embed in
+                                       zip(latent, embed_env_params)])
+                del embed_env_params
             output = self.decoder(latent)
             output = torch.split(output, n_query)
             out = {"output": output, "volume": volume}
         else:
             n_chunk = int(torch.ceil(torch.tensor(n_query).sum() / self.val_n_query))
             uv = [torch.chunk(p, n_chunk, dim=1) for p in uv]
-            query_points = torch.chunk(query_points, n_chunk) if query_points is not None else None
+            embed_query_points = torch.chunk(embed_query_points, n_chunk) if embed_query_points is not None else None
             output = [torch.empty(0,device=image_features[0].device)] * len(n_query)
             for chunk in range(n_chunk):
                 uv_chunk = [p[chunk] for p in uv]
                 n_split = [points.shape[1] for points in uv_chunk]
                 latent_chunk = self._image_encoder.sample_roi(image_features, uv_chunk)#.transpose(1, 2)
                 latent_chunk = torch.vstack(latent_chunk).transpose(0, 1)
-                if query_points is not None:
+                if embed_query_points is not None:
                     assert Vbatch == 1
-                    query_points_chunk = query_points[chunk]
+                    query_points_chunk = embed_query_points[chunk]
                     query_points_chunk = query_points_chunk.unsqueeze(1).expand(-1, latent_chunk.shape[1], -1)
                     latent_chunk = torch.cat((latent_chunk, query_points_chunk), -1)
                     del query_points_chunk
@@ -180,6 +238,13 @@ class NeMFnet(torch.nn.Module):
                     embed_camera_center_chunk = embed_camera_center_chunk.reshape(-1, *embed_camera_center_chunk.shape[2:])
                     latent_chunk = torch.cat((latent_chunk, embed_camera_center_chunk), -1)
                     del embed_camera_center_chunk
+                if embed_env_params is not None:
+                    assert Vbatch == 1
+                    embed_env_params = embed_env_params.expand(-1, latent_chunk.shape[1], -1)
+                    embed_env_params_chunk = embed_env_params.unsqueeze(1).expand(-1, int(latent_chunk.shape[0] / Vbatch), -1, -1)
+                    embed_env_params_chunk = embed_env_params_chunk.reshape(-1, *embed_env_params_chunk.shape[2:])
+                    latent_chunk = torch.cat((latent_chunk, embed_env_params_chunk), -1)
+                    del embed_env_params_chunk
 
                 output_chunk = self.decoder(latent_chunk)
                 output_chunk = torch.split(output_chunk, n_split)

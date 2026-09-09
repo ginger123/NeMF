@@ -38,7 +38,7 @@ mass_error = lambda ext_est, ext_gt, eps=1e-6 : (torch.norm(ext_gt.view(-1),p=1)
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
 rho_water = 1e6  # g/m^3
 
-@hydra.main(config_path=CONFIG_DIR, config_name="microphysics_train")
+@hydra.main(config_path=CONFIG_DIR, config_name="microphysics_train_w_env")  #"microphysics_train")
 def main(cfg: DictConfig):
 
     # Set the relevant seeds for reproducibility.
@@ -58,14 +58,19 @@ def main(cfg: DictConfig):
         )
         device = "cpu"
 
-    assert (("mask" in cfg.optimizer.loss) and ("mask" in cfg.decoder.name)
-            or ("mask" not in cfg.optimizer.loss) and ("mask" not in cfg.decoder.name))
+    assert ((("mask" in cfg.optimizer.loss) and ("mask" in cfg.decoder.name))
+            or (("mask" not in cfg.optimizer.loss) and ("mask" not in cfg.decoder.name)))
 
     # Load the training/validation data.
     train_dataset, val_dataset, _ = get_cloud_microphysics_datasets(cfg=cfg)
 
+    # set the number of environment input parameters
+    env_params_num = 0
+    if cfg.ct_net.use_sun_angle:
+        env_params_num = env_params_num + 2
+
     # Initialize the CT model.
-    model = NeMFnet(cfg=cfg, n_cam=cfg.data.n_cam)
+    model = NeMFnet(cfg=cfg, n_cam=cfg.data.n_cam, env_params_num=env_params_num)
 
     # Move the model to the relevant device.
     model.to(device)
@@ -152,6 +157,8 @@ def main(cfg: DictConfig):
     err = torch.nn.MSELoss()
     err_BCE = torch.nn.BCELoss()
 
+
+
     # Set the model to the training mode.
     model.train().float()
 
@@ -169,9 +176,19 @@ def main(cfg: DictConfig):
                 # Adjust the learning rate.
                 lr_scheduler.step()
 
-            images, microphysics, grid, image_sizes, projection_matrix, camera_center, masks = batch#[0]#.values()
+            images, microphysics, grid, image_sizes, projection_matrix, camera_center, masks, env_params = batch#[0]#.values()
 
             images = torch.tensor(images, device=device).float()
+            if (not cfg.ct_net.use_sun_angle):
+                env_params = None
+            if env_params is not None:
+                env_params = torch.tensor(env_params, device=device).float()
+                if env_params[0,0,0] < cfg.data.sun_zenith_threshold:
+                    continue
+                # if cfg.data.env_params_num == 2:  # sun az and zen
+                #     env_params = env_params[:, :, -2:]
+                # else:
+                #     env_params = env_params[:, :, :cfg.data.env_params_num]
             volume = Volumes(torch.tensor(microphysics, device=device).float(), grid)
             cameras = PerspectiveCameras(image_size=image_sizes,P=torch.tensor(projection_matrix, device=device).float(),
                                          camera_center= torch.tensor(camera_center, device=device).float(), device=device)
@@ -186,6 +203,7 @@ def main(cfg: DictConfig):
                 images,
                 volume,
                 masks,
+                env_params
             )
 
             if 'mask' in cfg.optimizer.loss:
@@ -229,6 +247,41 @@ def main(cfg: DictConfig):
                 loss_reff = [err(est.squeeze()[gt_lwc[i].squeeze()!=0],gt.squeeze()[gt_lwc[i].squeeze()!=0])/(torch.norm(gt.squeeze()[gt_lwc[i].squeeze()!=0])+ 1e-4) for i,(est, gt) in enumerate(zip(est_reff, gt_reff))]
                 loss_veff = [err(est.squeeze()[gt_lwc[i].squeeze()!=0],gt.squeeze()[gt_lwc[i].squeeze()!=0])/(torch.norm(gt.squeeze()[gt_lwc[i].squeeze()!=0])+ 1e-4) for i,(est, gt) in enumerate(zip(est_veff, gt_veff))]
                 loss = torch.mean(torch.stack(loss_reff)) + torch.mean(torch.stack(loss_lwc)) + torch.mean(torch.stack(loss_veff)) + torch.mean(torch.stack(loss_mask))
+            elif cfg.optimizer.loss == 'L2_relative_error_with_mask_unitless':
+                loss_mask = [err_BCE(est.squeeze(), gt.squeeze()) for est, gt in zip(est_mask, gt_mask)]
+                loss_lwc = [torch.sqrt(err(est.squeeze(), gt.squeeze())) / (torch.norm(gt.squeeze()) + 1e-4) for est, gt in
+                            zip(est_lwc, gt_lwc)]
+                if (gt_lwc[0].squeeze() != 0).sum() != 0:
+                    loss_reff = [torch.sqrt(err(est.squeeze()[gt_lwc[i].squeeze() != 0], gt.squeeze()[gt_lwc[i].squeeze() != 0])) / (
+                                torch.norm(gt.squeeze()[gt_lwc[i].squeeze() != 0]) + 1e-4) for i, (est, gt) in
+                                 enumerate(zip(est_reff, gt_reff))]
+                    loss_veff = [torch.sqrt(err(est.squeeze()[gt_lwc[i].squeeze() != 0], gt.squeeze()[gt_lwc[i].squeeze() != 0])) / (
+                                torch.norm(gt.squeeze()[gt_lwc[i].squeeze() != 0]) + 1e-4) for i, (est, gt) in
+                                 enumerate(zip(est_veff, gt_veff))]
+                    loss = torch.mean(torch.stack(loss_reff)) + 1000 * torch.mean(torch.stack(loss_lwc)) + torch.mean(
+                        torch.stack(loss_veff)) + torch.mean(torch.stack(loss_mask))
+                else:
+                    loss = 1000 * torch.mean(torch.stack(loss_lwc)) + torch.mean(torch.stack(loss_mask))
+                if loss.isnan():
+                    aa = 9
+            elif cfg.optimizer.loss == 'L2_relative_error_with_mask_unitless_nor':
+                loss_mask = [err_BCE(est.squeeze(), gt.squeeze()) for est, gt in zip(est_mask, gt_mask)]
+                loss_lwc = [torch.sqrt(err(est.squeeze(), gt.squeeze())) / (torch.norm(gt.squeeze()) + 1e-4) for est, gt in
+                            zip(est_lwc, gt_lwc)]
+                loss_veff = [torch.sqrt(err(est.squeeze()[gt_lwc[i].squeeze() != 0], gt.squeeze()[gt_lwc[i].squeeze() != 0])) / (
+                            torch.norm(gt.squeeze()[gt_lwc[i].squeeze() != 0]) + 1e-4) for i, (est, gt) in
+                             enumerate(zip(est_veff, gt_veff))]
+                loss = torch.mean(torch.stack(loss_lwc)) + torch.mean(
+                    torch.stack(loss_veff)) + torch.mean(torch.stack(loss_mask))
+            elif cfg.optimizer.loss == 'L2_relative_error_with_mask_unitless_justlwc':
+                loss_mask = [err_BCE(est.squeeze(), gt.squeeze()) for est, gt in zip(est_mask, gt_mask)]
+                loss_lwc = [torch.sqrt(err(est.squeeze(), gt.squeeze())) / (torch.norm(gt.squeeze()) + 1e-4) for est, gt
+                            in zip(est_lwc, gt_lwc)]
+                loss = torch.mean(torch.stack(loss_lwc)) + torch.mean(torch.stack(loss_mask))
+            elif cfg.optimizer.loss == 'L2_relative_error_unitless_justlwc':
+                loss_lwc = [torch.sqrt(err(est.squeeze(), gt.squeeze())) / (torch.norm(gt.squeeze()) + 1e-4) for est, gt
+                            in zip(est_lwc, gt_lwc)]
+                loss = torch.mean(torch.stack(loss_lwc))
             else:
                 NotImplementedError()
 
@@ -276,16 +329,18 @@ def main(cfg: DictConfig):
                     if "mask" in cfg.optimizer.loss:
                         writer.monitor_loss(torch.mean(torch.stack(loss_mask)).item())
                     writer.monitor_scatterer_error(relative_mass_err_lwc, relative_err_lwc, 'lwc')
-                    writer.monitor_scatterer_error(relative_mass_err_reff, relative_err_reff, 'reff')
-                    writer.monitor_scatterer_error(relative_mass_err_veff, relative_err_veff, 'veff')
+                    if (gt_lwc[0].squeeze() != 0).sum() != 0:
+                        writer.monitor_scatterer_error(relative_mass_err_reff, relative_err_reff, 'reff')
+                        writer.monitor_scatterer_error(relative_mass_err_veff, relative_err_veff, 'veff')
                     # writer.monitor_distributions(dist_est, dist_gt, r)
                     for ind in range(len(out["output"])):
                         writer.monitor_scatter_plot(est_lwc[ind], gt_lwc[ind],ind=ind,name='lwc')
-                        writer.monitor_scatter_plot(est_reff[ind][gt_lwc[ind]!=0], gt_reff[ind][gt_lwc[ind]!=0],ind=ind,name='reff')
-                        writer.monitor_scatter_plot(est_veff[ind], gt_veff[ind], ind=ind, name='veff_reff',
-                                                    colorbar_param = gt_reff[ind], colorbar_name = 'gt_reff')
-                        writer.monitor_scatter_plot(est_veff[ind], gt_veff[ind], ind=ind, name='veff_height',
-                                                    colorbar_param=gt_height[ind], colorbar_name='gt_height')
+                        if (gt_lwc[0].squeeze() != 0).sum() != 0:
+                            writer.monitor_scatter_plot(est_reff[ind][gt_lwc[ind]!=0], gt_reff[ind][gt_lwc[ind]!=0],ind=ind,name='reff')
+                            writer.monitor_scatter_plot(est_veff[ind], gt_veff[ind], ind=ind, name='veff_reff',
+                                                        colorbar_param = gt_reff[ind], colorbar_name = 'gt_reff')
+                            writer.monitor_scatter_plot(est_veff[ind], gt_veff[ind], ind=ind, name='veff_height',
+                                                        colorbar_param=gt_height[ind], colorbar_name='gt_height')
                     # writer.monitor_images(images)
 
             # Validation
@@ -302,14 +357,19 @@ def main(cfg: DictConfig):
                 val_i = 0
                 for val_i, val_batch in enumerate(val_dataloader):
 
-                    val_image, microphysics, grid, image_sizes, projection_matrix, camera_center, masks = val_batch
+                    val_image, microphysics, grid, image_sizes, projection_matrix, camera_center, masks, env_params = val_batch
+
                     val_image = torch.tensor(val_image, device=device).float()
+                    if (not cfg.ct_net.use_sun_angle):
+                        env_params = None
+                    if env_params is not None:
+                        env_params = torch.tensor(env_params, device=device).float()
                     val_volume = Volumes(torch.tensor(microphysics, device=device).float(), grid)
                     val_camera = PerspectiveCameras(image_size=image_sizes,P=torch.tensor(projection_matrix, device=device).float(),
                                          camera_center= torch.tensor(camera_center, device=device).float(), device=device)
                     masks = [torch.tensor(mask) if mask is not None else mask for mask in masks]
 
-                    if torch.sum(torch.tensor([(mask).sum() if mask is not None else mask for mask in masks])) == 0:
+                    if (masks[0] is not None) and (torch.sum(torch.tensor([(mask).sum() if mask is not None else mask for mask in masks])) == 0):
                         continue
                     # Activate eval mode of the model (lets us do a full rendering pass).
                     model.eval()
@@ -319,6 +379,7 @@ def main(cfg: DictConfig):
                             val_image,
                             val_volume,
                             masks,
+                            env_params
                         )
                         if "mask" in cfg.optimizer.loss:
                             gt_shape = val_volume.extinctions.shape
@@ -384,6 +445,41 @@ def main(cfg: DictConfig):
                             loss_veff = err(est_veff_for_loss[gt_lwc_for_loss != 0],
                                             gt_veff_for_loss[gt_lwc_for_loss != 0])/(torch.norm(gt_veff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
                             loss_val += loss_reff + loss_lwc + loss_veff + loss_mask
+                        elif cfg.optimizer.loss == 'L2_relative_error_with_mask_unitless':
+                            est_mask_for_loss = est_mask.flatten()[est_lwc.flatten() > 0]
+                            gt_mask_for_loss = gt_mask.flatten()[est_lwc.flatten() > 0]
+                            loss_mask = err_BCE(est_mask_for_loss, gt_mask_for_loss)
+                            loss_lwc = torch.sqrt(err(est_lwc_for_loss, gt_lwc_for_loss))/(torch.norm(gt_lwc_for_loss)+ 1e-4)
+                            loss_reff = torch.sqrt(err(est_reff_for_loss[gt_lwc_for_loss != 0],
+                                            gt_reff_for_loss[gt_lwc_for_loss != 0]))/(torch.norm(gt_reff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
+                            loss_veff = torch.sqrt(err(est_veff_for_loss[gt_lwc_for_loss != 0],
+                                            gt_veff_for_loss[gt_lwc_for_loss != 0]))/(torch.norm(gt_veff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
+                            loss_val += loss_reff + 1000*loss_lwc + loss_veff + loss_mask
+                        elif cfg.optimizer.loss == 'L2_relative_error_with_mask_unitless_nor':
+                            est_mask_for_loss = est_mask.flatten()[est_lwc.flatten() > 0]
+                            gt_mask_for_loss = gt_mask.flatten()[est_lwc.flatten() > 0]
+                            loss_mask = err_BCE(est_mask_for_loss, gt_mask_for_loss)
+                            loss_lwc = torch.sqrt(err(est_lwc_for_loss, gt_lwc_for_loss))/(torch.norm(gt_lwc_for_loss)+ 1e-4)
+                            loss_veff = torch.sqrt(err(est_veff_for_loss[gt_lwc_for_loss != 0],
+                                            gt_veff_for_loss[gt_lwc_for_loss != 0]))/(torch.norm(gt_veff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
+                            loss_val += loss_lwc + loss_veff + loss_mask
+                        elif cfg.optimizer.loss == 'L2_relative_error_with_mask_unitless_nor':
+                            est_mask_for_loss = est_mask.flatten()[est_lwc.flatten() > 0]
+                            gt_mask_for_loss = gt_mask.flatten()[est_lwc.flatten() > 0]
+                            loss_mask = err_BCE(est_mask_for_loss, gt_mask_for_loss)
+                            loss_lwc = torch.sqrt(err(est_lwc_for_loss, gt_lwc_for_loss))/(torch.norm(gt_lwc_for_loss)+ 1e-4)
+                            loss_veff = torch.sqrt(err(est_veff_for_loss[gt_lwc_for_loss != 0],
+                                            gt_veff_for_loss[gt_lwc_for_loss != 0]))/(torch.norm(gt_veff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
+                            loss_val += loss_lwc + loss_veff + loss_mask
+                        elif cfg.optimizer.loss == 'L2_relative_error_with_mask_unitless_justlwc':
+                            est_mask_for_loss = est_mask.flatten()[est_lwc.flatten() > 0]
+                            gt_mask_for_loss = gt_mask.flatten()[est_lwc.flatten() > 0]
+                            loss_mask = err_BCE(est_mask_for_loss, gt_mask_for_loss)
+                            loss_lwc = torch.sqrt(err(est_lwc_for_loss, gt_lwc_for_loss))/(torch.norm(gt_lwc_for_loss)+ 1e-4)
+                            loss_val += loss_lwc + loss_mask
+                        elif cfg.optimizer.loss == 'L2_relative_error_unitless_justlwc':
+                            loss_lwc = torch.sqrt(err(est_lwc_for_loss, gt_lwc_for_loss))/(torch.norm(gt_lwc_for_loss)+ 1e-4)
+                            loss_val += loss_lwc
                         else:
                             NotImplementedError()
 
@@ -396,7 +492,8 @@ def main(cfg: DictConfig):
                         relative_err_veff += relative_error(ext_est=est_veff, ext_gt=gt_veff).item()
                         relative_mass_err_veff += mass_error(ext_est=est_veff, ext_gt=gt_veff).item()
 
-                        bce_err_mask += loss_mask
+                        if 'mask' in cfg.optimizer.loss:
+                            bce_err_mask += loss_mask
 
                         if writer:
                             writer._iter = iteration

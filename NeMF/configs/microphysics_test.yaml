@@ -1,18 +1,33 @@
 hydra:
   run:
-    dir: /home/inbalkom/NN_outputs/test/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: /wdata_visl/inbalkom/NN_outputs/test/${now:%Y-%m-%d}/${now:%H-%M-%S}
 seed: 3
 debug: False
 gpu: 0
 save_results: True
 choose_thr_from_val_set: True
 show: False
-checkpoint_resume_path: "/wdata_visl/inbalkom/NN_outputs/2024-03-10/14-26-30-BOMEX-PYSHDOM-Train0-nocloudbow-const_4NeMF/checkpoints/cp_270000.pth"
+checkpoint_resume_path: "/wdata_visl/inbalkom/NN_outputs/2024-12-08/scatter2in-15-58-12/checkpoints/cp_200000.pth"
+  # "/wdata_visl/inbalkom/NN_outputs/2024-11-24/regularunitless-12-45-40/checkpoints/cp_300000.pth"
+  #"/wdata_visl/inbalkom/NN_outputs/2024-11-21/abitvarsun2wsun-10-41-21/checkpoints/cp_400000.pth"
+  # "/wdata_visl/inbalkom/NN_outputs/2024-11-21/abitvarsun2wosun-10-44-33/checkpoints/cp_310000.pth"
+  # "/wdata_visl/inbalkom/NN_outputs/2024-11-20/abitvarsun-14-11-29/checkpoints/cp_400000.pth"
+  # "/wdata_visl/inbalkom/NN_outputs/2024-11-18/abitvarsun-08-58-53/checkpoints/cp_410000.pth"
+  # "/wdata_visl/inbalkom/NN_outputs/2024-11-06/nor-15-18-43/checkpoints/cp_980000.pth"
+  # "/wdata_visl/inbalkom/NN_outputs/2024-11-06/09-43-41/checkpoints/cp_1090000.pth"
+  # "/wdata_visl/inbalkom/NN_outputs/2024-11-06/1000-10-38-12/checkpoints/cp_680000.pth"
+  # "/wdata_visl/inbalkom/NN_outputs/2024-11-06/nor-15-18-43/checkpoints/cp_600000.pth"
+  # "/wdata_visl/inbalkom/NN_outputs/2024-11-06/09-43-41/checkpoints/cp_680000.pth"
+  # "/wdata_visl/inbalkom/NN_outputs/2024-11-02/20-44-17/checkpoints/cp_980000.pth"
+  # "/wdata_visl/inbalkom/NN_outputs/2024-03-10/14-26-30-BOMEX-PYSHDOM-Train0-nocloudbow-const_4NeMF/checkpoints/cp_270000.pth"
   # "/wdata_visl/inbalkom/NN_outputs/2024-03-03/20-57-21-BOMEX-PYSHDOM-Train0-nocloudbow-varsats-M/checkpoints/cp_290000.pth"
   # "/wdata_visl/inbalkom/NN_outputs/2024-03-02/01-47-37-CASS-PYSHDOM-Train0-nocloudbow/checkpoints/cp_240000.pth"
 data:
-  dataset_name: "BOMEX_500CCN_10cams_20m_polarization_pyshdom"  
-  # "BOMEX_500CCN_10cams_20m_polarization_pyshdom"  
+  dataset_name: "BOMEX_500CCN_10cams_20m_polarization_pyshdom_ida"
+  # "BOMEX_500CCN_10cams_20m_polarization_pyshdom"
+  # "BOMEX_polarization_pyshdom_varsunsync"
+  # "BOMEX_polarization_pyshdom_varsun"
+  # "BOMEX_500CCN_10cams_20m_polarization_pyshdom"
   # "BOMEX_polarization_pyshdom_varying_M" 
   # "CASS_10cams_20m_polarization_pyshdom"
   data_source: "pyshdom"
