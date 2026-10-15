@@ -72,7 +72,9 @@ def main(cfg: DictConfig):
     # Init stats to None before loading.
     stats = None
     optimizer_state_dict = None
+    lr_scheduler_state_dict = None
     start_epoch = 0
+    start_iteration = -1
 
     #
     log_dir = os.getcwd()
@@ -89,10 +91,15 @@ def main(cfg: DictConfig):
         print(f"Resuming from checkpoint {checkpoint_resume_path}.")
         loaded_data = torch.load(checkpoint_resume_path, map_location=device)
         model.load_state_dict(loaded_data["model"])
-        # stats = pickle.loads(loaded_data["stats"])
-        # print(f"   => resuming from epoch {stats.epoch}.")
-        # optimizer_state_dict = loaded_data["optimizer"]
-        # start_epoch = stats.epoch
+        # Older checkpoints lack some of these keys, so fall back to fresh state.
+        optimizer_state_dict = loaded_data.get("optimizer")
+        lr_scheduler_state_dict = loaded_data.get("lr_scheduler")
+        if "stats" in loaded_data:
+            stats = pickle.loads(loaded_data["stats"])
+        # Note: stats.epoch counts print intervals, not dataloader epochs.
+        start_epoch = loaded_data.get("epoch", 0)
+        start_iteration = loaded_data.get("iteration", -1)
+        print(f"   => resuming from iteration {start_iteration}, epoch {start_epoch}.")
 
     init_lr = cfg.optimizer.lr
 
@@ -102,11 +109,6 @@ def main(cfg: DictConfig):
         lr=init_lr,
         weight_decay=cfg.optimizer.wd,
     )
-
-    # Load the optimizer state dict in case we are resuming.
-    if optimizer_state_dict is not None:
-        optimizer.load_state_dict(optimizer_state_dict)
-        optimizer.last_epoch = start_epoch
 
     # Init the stats object.
     if stats is None:
@@ -131,8 +133,15 @@ def main(cfg: DictConfig):
 
     # The learning rate scheduling is implemented with LambdaLR PyTorch scheduler.
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda, last_epoch=start_epoch - 1, verbose=False
+        optimizer, lr_lambda, verbose=False
     )
+
+    # Restore optimizer/scheduler state after the scheduler is built, so the
+    # scheduler's constructor doesn't overwrite the restored lr / initial_lr.
+    if optimizer_state_dict is not None:
+        optimizer.load_state_dict(optimizer_state_dict)
+    if lr_scheduler_state_dict is not None:
+        lr_scheduler.load_state_dict(lr_scheduler_state_dict)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -156,7 +165,7 @@ def main(cfg: DictConfig):
     model.train().float()
 
     # Run the main training loop.
-    iteration = -1
+    iteration = start_iteration
     if writer:
         val_scatter_ind = np.random.permutation(len(val_dataloader))[:5]
     for epoch in range(start_epoch, cfg.optimizer.max_epochs):
@@ -456,7 +465,10 @@ def main(cfg: DictConfig):
                 data_to_store = {
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "lr_scheduler": lr_scheduler.state_dict(),
                     "stats": pickle.dumps(stats),
+                    "iteration": iteration,
+                    "epoch": epoch,
                 }
                 torch.save(data_to_store, curr_checkpoint_path)
 
