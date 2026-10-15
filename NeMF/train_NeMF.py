@@ -274,7 +274,7 @@ def main(cfg: DictConfig):
                     writer._dataset = 'train'
                     writer.monitor_loss(loss.item())
                     if "mask" in cfg.optimizer.loss:
-                        writer.monitor_loss(torch.mean(torch.stack(loss_mask)).item())
+                        writer.monitor_loss(torch.mean(torch.stack(loss_mask)).item(), title='loss_bce')
                     writer.monitor_scatterer_error(relative_mass_err_lwc, relative_err_lwc, 'lwc')
                     writer.monitor_scatterer_error(relative_mass_err_reff, relative_err_reff, 'reff')
                     writer.monitor_scatterer_error(relative_mass_err_veff, relative_err_veff, 'veff')
@@ -430,8 +430,9 @@ def main(cfg: DictConfig):
                 if writer:
                     writer._iter = iteration
                     writer._dataset = 'val'#.format(val_i)
-                    writer.monitor_loss(loss_val)
-                    writer.monitor_loss(bce_err_mask)
+                    writer.monitor_loss(float(loss_val))
+                    if "mask" in cfg.optimizer.loss:
+                        writer.monitor_loss(float(bce_err_mask), title='loss_bce')
                     writer.monitor_scatterer_error(relative_mass_err_lwc, relative_err_lwc, 'lwc')
                     writer.monitor_scatterer_error(relative_mass_err_reff, relative_err_reff, 'reff')
                     writer.monitor_scatterer_error(relative_mass_err_veff, relative_err_veff, 'veff')

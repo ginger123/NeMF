@@ -61,19 +61,22 @@ class SummaryWriter(object):
         self._callback_fns.append(callback_fn)
         self._kwargs.append(kwargs)
 
-    def monitor_loss(self, loss):
+    def monitor_loss(self, loss, title='loss'):
         """
         Monitor the loss.
 
         Parameters
         ----------
-        ckpt_period: float
-           time [seconds] between updates. setting ckpt_period=-1 will log at every iteration.
+        loss: float
+            The loss value to log.
+        title: str
+            The tensorboard tag. Use a distinct title per loss term, otherwise values logged
+            at the same iteration overwrite each other.
         """
         kwargs = {
             'loss': loss,
             'ckpt_time': self._iter,
-            'title': 'loss',
+            'title': title,
         }
         self.loss_cbfn(kwargs)
 
