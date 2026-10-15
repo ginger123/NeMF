@@ -347,7 +347,7 @@ def main(cfg: DictConfig):
                             gt_mask = ((gt_lwc>0).float())
                             gt_reff = gt_vol[1][est_vols[0]!=0]
                             gt_veff = gt_vol[2][est_vols[0]!=0]
-                            gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32)).repeat(gt_vol[0].shape[0], gt_vol[0].shape[1], 1)
+                            gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32), device=val_volume.device).repeat(gt_vol[0].shape[0], gt_vol[0].shape[1], 1)
                             gt_height = gt_height[est_vols[0]!=0]
                         else:
                             est_lwc = est_vols[0]
@@ -357,7 +357,7 @@ def main(cfg: DictConfig):
                             gt_lwc = gt_vol[0]
                             gt_reff = gt_vol[1]
                             gt_veff = gt_vol[2]
-                            gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32)).repeat(gt_lwc.shape[0], gt_lwc.shape[1], 1)
+                            gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32), device=val_volume.device).repeat(gt_lwc.shape[0], gt_lwc.shape[1], 1)
 
 
                         est_lwc_for_loss = est_lwc.flatten()[est_lwc.flatten() > 0]
