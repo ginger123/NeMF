@@ -1,0 +1,27 @@
+# Python dependencies for NeMF (pip-installable — this replaces the old
+# `conda list --export` dump, which used conda's pkg=version=build syntax
+# and was not valid input for `pip install -r requirements.txt`).
+#
+# Install torch/torchvision/torchaudio first, from PyTorch's CUDA 12.1 index
+# (matches an Ampere+ GPU, e.g. RTX 30-series, with driver CUDA >= 12.1):
+#   pip install torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 --index-url https://download.pytorch.org/whl/cu121
+# Then install the rest from this file:
+#   pip install -r requirements.txt
+#
+# Note: the TkAgg matplotlib backend used by test_NeMF.py needs tkinter,
+# which comes from the conda python package itself, not pip.
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+hydra-core==1.1.1
+omegaconf==2.1.2
+numpy==1.24.4
+scipy==1.10.1
+matplotlib==3.7.5
+pillow==9.5.0
+pytorch-ignite==0.4.13
+dill==0.3.4
+# For tensorboard
+tensorboardX==2.6.2
+tensorboard==2.14.0
+tensorboard-data-server==0.7.2

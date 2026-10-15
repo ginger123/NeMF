@@ -1,0 +1,5 @@
+.vscode
+NN_outputs/
+__pycache__/
+summary.md
+session-summary.md
