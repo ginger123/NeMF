@@ -122,6 +122,8 @@ class NeMFnet(torch.nn.Module):
                 volume, query_points, query_indices = volume.get_query_points_microphysics(self.n_query, self.query_point_method, masks = masks)
         else:
             volume, query_points, query_indices = volume.get_query_points_microphysics(self.val_n_query, self.query_point_val_method, masks = masks)
+        # Per-sample xyz of the queried voxels, kept before mlp_xyz overwrites query_points.
+        query_points_out = query_points
         n_query = [points.shape[0] for points in query_points]
         if self.data_source == "at3d":
             uv = cameras.project_points_at3d(query_points,screen=True)
@@ -157,7 +159,7 @@ class NeMFnet(torch.nn.Module):
 				
             output = self.decoder(latent)
             output = torch.split(output, n_query)
-            out = {"output": output, "volume": volume}
+            out = {"output": output, "volume": volume, "query_points": query_points_out}
         else:
             n_chunk = int(torch.ceil(torch.tensor(n_query).sum() / self.val_n_query))
             uv = [torch.chunk(p, n_chunk, dim=1) for p in uv]
@@ -184,7 +186,7 @@ class NeMFnet(torch.nn.Module):
                 output_chunk = self.decoder(latent_chunk)
                 output_chunk = torch.split(output_chunk, n_split)
                 output = [torch.cat((out_i, out_chunk_i)) for out_i, out_chunk_i in zip(output, output_chunk)]
-            out = {"output": output, "volume": volume, 'query_indices': query_indices}
+            out = {"output": output, "volume": volume, 'query_indices': query_indices, "query_points": query_points_out}
 
         return out
 

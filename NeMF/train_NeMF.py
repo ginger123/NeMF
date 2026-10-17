@@ -217,14 +217,6 @@ def main(cfg: DictConfig):
                 gt_reff = [ext_gt[:, 1] for ext_gt in out["volume"]]
                 gt_veff = [ext_gt[:, 2] for ext_gt in out["volume"]]
 
-            gt_height = [torch.zeros_like(ext_gt[:,0]) for ext_gt in out["volume"]]
-            for list_ind in torch.arange(len(gt_veff)):
-                for ind in torch.arange(len(gt_veff[0])):
-                    sample_inds = (torch.abs(volume.extinctions[:,0,:,:]-gt_lwc[0][ind]) +
-                                        torch.abs(volume.extinctions[:,1,:,:]-gt_reff[0][ind]) +
-                                        torch.abs(volume.extinctions[:,2,:,:]-gt_veff[0][ind]) < 1e-6).nonzero()[0,1:]
-                    gt_height[list_ind][ind] = float(volume._grid[0][2][int(sample_inds[2])])
-
             # The loss is a sum of coarse and fine MSEs
 
             if cfg.optimizer.loss == 'L2_relative_error':
@@ -289,6 +281,13 @@ def main(cfg: DictConfig):
                     writer.monitor_scatterer_error(relative_mass_err_reff, relative_err_reff, 'reff')
                     writer.monitor_scatterer_error(relative_mass_err_veff, relative_err_veff, 'veff')
                     # writer.monitor_distributions(dist_est, dist_gt, r)
+                    # Note: gt_height used to be computed outside this block on every
+                    # iteration by searching the volume for each voxel's (lwc, reff, veff)
+                    # values, but it is only needed for the veff_height plot below, so it
+                    # was moved here for optimization. It now reads the z coordinate of
+                    # the queried voxels directly, which is exact (the search gave all
+                    # zero-valued voxels the height of the first zero voxel).
+                    gt_height = [points[:, 2] for points in out["query_points"]]
                     for ind in range(len(out["output"])):
                         writer.monitor_scatter_plot(est_lwc[ind], gt_lwc[ind],ind=ind,name='lwc')
                         writer.monitor_scatter_plot(est_reff[ind][gt_lwc[ind]!=0], gt_reff[ind][gt_lwc[ind]!=0],ind=ind,name='reff')
