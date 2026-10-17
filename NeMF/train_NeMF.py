@@ -174,6 +174,7 @@ def main(cfg: DictConfig):
             # lr_scheduler(None)
             if iteration % (cfg.stats_print_interval) == 0 and iteration > 0:
                 stats.new_epoch()  # Init a new epoch.
+            # Note: current config means this isn't actually ever called due to huge iter steps
             if iteration in cfg.optimizer.iter_steps:
                 # Adjust the learning rate.
                 lr_scheduler.step()
@@ -299,162 +300,9 @@ def main(cfg: DictConfig):
 
             # Validation
             if iteration % cfg.validation_iter_interval == 0 and iteration > 0:
-                loss_val = 0
-                bce_err_mask = 0
-                relative_err_lwc= 0
-                relative_mass_err_lwc = 0
-                relative_err_reff= 0
-                relative_mass_err_reff = 0
-                relative_err_veff = 0
-                relative_mass_err_veff = 0
+                run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_BCE, iteration, val_scatter_ind)
 
-                val_i = 0
-                for val_i, val_batch in enumerate(val_dataloader):
-
-                    val_image, microphysics, grid, image_sizes, projection_matrix, camera_center, masks = val_batch
-                    val_image = torch.tensor(val_image, device=device).float()
-                    val_volume = Volumes(torch.tensor(microphysics, device=device).float(), grid)
-                    val_camera = PerspectiveCameras(image_size=image_sizes,P=torch.tensor(projection_matrix, device=device).float(),
-                                         camera_center= torch.tensor(camera_center, device=device).float(), device=device)
-                    masks = [torch.tensor(mask) if mask is not None else mask for mask in masks]
-
-                    if torch.sum(torch.tensor([(mask).sum() if mask is not None else mask for mask in masks])) == 0:
-                        continue
-                    # Activate eval mode of the model (lets us do a full rendering pass).
-                    model.eval()
-                    with torch.no_grad():
-                        val_out = model(
-                            val_camera,
-                            val_image,
-                            val_volume,
-                            masks,
-                        )
-                        if "mask" in cfg.optimizer.loss:
-                            gt_shape = val_volume.extinctions.shape
-                            est_vols = torch.zeros((gt_shape[0], gt_shape[1] + 1, gt_shape[2], gt_shape[3], gt_shape[4]),
-                                                   device=val_volume.device)  # plus 1 for mask
-                        else:
-                            est_vols = torch.zeros(val_volume.extinctions.shape, device=val_volume.device)
-                        if val_out['query_indices'] is None:
-                            for i, (out_vol, m) in enumerate(zip(val_out["output"], masks)):
-                                est_vols[i][m.squeeze(0)] = out_vol.squeeze(1)
-                        else:
-                            for est_vol, out_vol, m in zip(est_vols, val_out["output"], val_out['query_indices']):
-                                est_vol = est_vol.reshape(est_vols.shape[1],-1)
-                                est_vol[:,m] = out_vol.T  # .reshape(m.shape)[m]
-                        assert len(est_vols)==1 ##TODO support validation with batch larger than 1
-                        gt_vol = val_volume.extinctions[0].squeeze()
-                        est_vols = est_vols.squeeze()
-
-                        if "mask" in cfg.optimizer.loss:
-                            est_lwc = est_vols[0][est_vols[0]!=0]
-                            est_mask = est_vols[1][est_vols[0]!=0]
-                            est_reff = est_vols[2][est_vols[0]!=0]
-                            est_veff = est_vols[3][est_vols[0]!=0]
-
-                            gt_lwc = gt_vol[0][est_vols[0]!=0]
-                            gt_mask = ((gt_lwc>0).float())
-                            gt_reff = gt_vol[1][est_vols[0]!=0]
-                            gt_veff = gt_vol[2][est_vols[0]!=0]
-                            gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32), device=val_volume.device).repeat(gt_vol[0].shape[0], gt_vol[0].shape[1], 1)
-                            gt_height = gt_height[est_vols[0]!=0]
-                        else:
-                            est_lwc = est_vols[0]
-                            est_reff = est_vols[1]
-                            est_veff = est_vols[2]
-
-                            gt_lwc = gt_vol[0]
-                            gt_reff = gt_vol[1]
-                            gt_veff = gt_vol[2]
-                            gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32), device=val_volume.device).repeat(gt_lwc.shape[0], gt_lwc.shape[1], 1)
-
-
-                        est_lwc_for_loss = est_lwc.flatten()[est_lwc.flatten() > 0]
-                        gt_lwc_for_loss = gt_lwc.flatten()[est_lwc.flatten() > 0]
-                        est_reff_for_loss = est_reff.flatten()[est_lwc.flatten() > 0]
-                        gt_reff_for_loss = gt_reff.flatten()[est_lwc.flatten() > 0]
-                        est_veff_for_loss = est_veff.flatten()[est_lwc.flatten() > 0]
-                        gt_veff_for_loss = gt_veff.flatten()[est_lwc.flatten() > 0]
-
-                        if cfg.optimizer.loss == 'L2_relative_error':
-                            loss_lwc = err(est_lwc_for_loss, gt_lwc_for_loss)
-                            #loss_reff = err(est_reff_for_loss/(gt_veff_for_loss+1e-4), gt_reff_for_loss/(gt_veff_for_loss+1e-4))
-                            loss_reff = err(est_reff_for_loss[gt_lwc_for_loss!=0], gt_reff_for_loss[gt_lwc_for_loss!=0])
-                            loss_veff = err(est_veff_for_loss[gt_lwc_for_loss != 0], gt_veff_for_loss[gt_lwc_for_loss != 0])
-                            loss_mask = 0.0
-                            loss_val += loss_reff + loss_lwc + loss_veff
-                        elif cfg.optimizer.loss == 'L2_relative_error_with_mask':
-                            est_mask_for_loss = est_mask.flatten()[est_lwc.flatten() > 0]
-                            gt_mask_for_loss = gt_mask.flatten()[est_lwc.flatten() > 0]
-                            loss_lwc = err(est_lwc_for_loss, gt_lwc_for_loss)/(torch.norm(gt_lwc_for_loss)+ 1e-4)
-                            loss_mask = err_BCE(est_mask_for_loss, gt_mask_for_loss)
-                            loss_reff = err(est_reff_for_loss[gt_lwc_for_loss != 0],
-                                            gt_reff_for_loss[gt_lwc_for_loss != 0])/(torch.norm(gt_reff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
-                            loss_veff = err(est_veff_for_loss[gt_lwc_for_loss != 0],
-                                            gt_veff_for_loss[gt_lwc_for_loss != 0])/(torch.norm(gt_veff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
-                            loss_val += loss_reff + loss_lwc + loss_veff + loss_mask
-                        else:
-                            NotImplementedError()
-
-                        relative_err_lwc += relative_error(ext_est=est_lwc,ext_gt=gt_lwc).item()
-                        relative_mass_err_lwc += mass_error(ext_est=est_lwc,ext_gt=gt_lwc).item()
-
-                        relative_err_reff += relative_error(ext_est=est_reff[gt_lwc!=0],ext_gt=gt_reff[gt_lwc!=0]).item()
-                        relative_mass_err_reff += mass_error(ext_est=est_reff[gt_lwc!=0],ext_gt=gt_reff[gt_lwc!=0]).item()
-
-                        relative_err_veff += relative_error(ext_est=est_veff, ext_gt=gt_veff).item()
-                        relative_mass_err_veff += mass_error(ext_est=est_veff, ext_gt=gt_veff).item()
-
-                        bce_err_mask += loss_mask
-
-                        if writer:
-                            writer._iter = iteration
-                            writer._dataset = 'val'  # .format(val_i)
-                            if val_i in val_scatter_ind:
-                                writer.monitor_scatter_plot(est_lwc, gt_lwc, ind=val_i, dilute_percent=1, name='lwc')
-                                writer.monitor_scatter_plot(est_reff[gt_lwc!=0], gt_reff[gt_lwc!=0],ind=val_i,dilute_percent=1,name='reff')
-                                writer.monitor_scatter_plot(est_veff, gt_veff, ind=val_i,dilute_percent=1, name='veff_reff',
-                                                        colorbar_param=gt_reff, colorbar_name='gt_reff')
-                                writer.monitor_scatter_plot(est_veff, gt_veff, ind=val_i,dilute_percent=1, name='veff_height',
-                                                        colorbar_param=gt_height, colorbar_name='gt_height')
-
-
-                loss_val /= (val_i + 1)
-                relative_err_lwc /= (val_i + 1)
-                relative_mass_err_lwc /= (val_i+1)
-
-                relative_err_reff /= (val_i + 1)
-                relative_mass_err_reff /= (val_i+1)
-
-                relative_err_veff /= (val_i + 1)
-                relative_mass_err_veff /= (val_i + 1)
-
-                bce_err_mask /= (val_i + 1)
-
-                # Update stats with the validation metrics.
-                stats.update({"loss": float(loss_val), "loss_bce": float(bce_err_mask), "relative_error_lwc": float(relative_err_lwc),
-                              "relative_error_reff": float(relative_err_reff),
-                              "relative_error_veff": float(relative_err_veff),}, stat_set="val")
-
-                if writer:
-                    writer._iter = iteration
-                    writer._dataset = 'val'#.format(val_i)
-                    writer.monitor_loss(float(loss_val))
-                    if "mask" in cfg.optimizer.loss:
-                        writer.monitor_loss(float(bce_err_mask), title='loss_bce')
-                    writer.monitor_scatterer_error(relative_mass_err_lwc, relative_err_lwc, 'lwc')
-                    writer.monitor_scatterer_error(relative_mass_err_reff, relative_err_reff, 'reff')
-                    writer.monitor_scatterer_error(relative_mass_err_veff, relative_err_veff, 'veff')
-                    # writer.monitor_images(val_image)
-
-                stats.print(stat_set="val")
-
-
-
-                # Set the model back to train mode.
-                model.train()
-
-                # Checkpoint.
+            # Checkpoint.
             if (
                 iteration % cfg.checkpoint_iteration_interval == 0
                 and len(checkpoint_dir) > 0
@@ -471,6 +319,161 @@ def main(cfg: DictConfig):
                     "epoch": epoch,
                 }
                 torch.save(data_to_store, curr_checkpoint_path)
+
+def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_BCE, iteration, val_scatter_ind):
+    loss_val = 0
+    bce_err_mask = 0
+    relative_err_lwc= 0
+    relative_mass_err_lwc = 0
+    relative_err_reff= 0
+    relative_mass_err_reff = 0
+    relative_err_veff = 0
+    relative_mass_err_veff = 0
+
+    val_i = 0
+    for val_i, val_batch in enumerate(val_dataloader):
+        val_image, microphysics, grid, image_sizes, projection_matrix, camera_center, masks = val_batch
+        val_image = torch.tensor(val_image, device=device).float()
+        val_volume = Volumes(torch.tensor(microphysics, device=device).float(), grid)
+        val_camera = PerspectiveCameras(image_size=image_sizes,P=torch.tensor(projection_matrix, device=device).float(),
+                                         camera_center= torch.tensor(camera_center, device=device).float(), device=device)
+        masks = [torch.tensor(mask) if mask is not None else mask for mask in masks]
+
+        if torch.sum(torch.tensor([(mask).sum() if mask is not None else mask for mask in masks])) == 0:
+            continue
+        # Activate eval mode of the model (lets us do a full rendering pass).
+        model.eval()
+        with torch.no_grad():
+            val_out = model(
+                            val_camera,
+                            val_image,
+                            val_volume,
+                            masks,
+                        )
+            if "mask" in cfg.optimizer.loss:
+                gt_shape = val_volume.extinctions.shape
+                est_vols = torch.zeros((gt_shape[0], gt_shape[1] + 1, gt_shape[2], gt_shape[3], gt_shape[4]),
+                                                   device=val_volume.device)  # plus 1 for mask
+            else:
+                est_vols = torch.zeros(val_volume.extinctions.shape, device=val_volume.device)
+            if val_out['query_indices'] is None:
+                for i, (out_vol, m) in enumerate(zip(val_out["output"], masks)):
+                    est_vols[i][m.squeeze(0)] = out_vol.squeeze(1)
+            else:
+                for est_vol, out_vol, m in zip(est_vols, val_out["output"], val_out['query_indices']):
+                    est_vol = est_vol.reshape(est_vols.shape[1],-1)
+                    est_vol[:,m] = out_vol.T  # .reshape(m.shape)[m]
+            assert len(est_vols)==1 ##TODO support validation with batch larger than 1
+            gt_vol = val_volume.extinctions[0].squeeze()
+            est_vols = est_vols.squeeze()
+
+            if "mask" in cfg.optimizer.loss:
+                est_lwc = est_vols[0][est_vols[0]!=0]
+                est_mask = est_vols[1][est_vols[0]!=0]
+                est_reff = est_vols[2][est_vols[0]!=0]
+                est_veff = est_vols[3][est_vols[0]!=0]
+
+                gt_lwc = gt_vol[0][est_vols[0]!=0]
+                gt_mask = ((gt_lwc>0).float())
+                gt_reff = gt_vol[1][est_vols[0]!=0]
+                gt_veff = gt_vol[2][est_vols[0]!=0]
+                gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32), device=val_volume.device).repeat(gt_vol[0].shape[0], gt_vol[0].shape[1], 1)
+                gt_height = gt_height[est_vols[0]!=0]
+            else:
+                est_lwc = est_vols[0]
+                est_reff = est_vols[1]
+                est_veff = est_vols[2]
+
+                gt_lwc = gt_vol[0]
+                gt_reff = gt_vol[1]
+                gt_veff = gt_vol[2]
+                gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32), device=val_volume.device).repeat(gt_lwc.shape[0], gt_lwc.shape[1], 1)
+
+
+            est_lwc_for_loss = est_lwc.flatten()[est_lwc.flatten() > 0]
+            gt_lwc_for_loss = gt_lwc.flatten()[est_lwc.flatten() > 0]
+            est_reff_for_loss = est_reff.flatten()[est_lwc.flatten() > 0]
+            gt_reff_for_loss = gt_reff.flatten()[est_lwc.flatten() > 0]
+            est_veff_for_loss = est_veff.flatten()[est_lwc.flatten() > 0]
+            gt_veff_for_loss = gt_veff.flatten()[est_lwc.flatten() > 0]
+
+            if cfg.optimizer.loss == 'L2_relative_error':
+                loss_lwc = err(est_lwc_for_loss, gt_lwc_for_loss)
+                            #loss_reff = err(est_reff_for_loss/(gt_veff_for_loss+1e-4), gt_reff_for_loss/(gt_veff_for_loss+1e-4))
+                loss_reff = err(est_reff_for_loss[gt_lwc_for_loss!=0], gt_reff_for_loss[gt_lwc_for_loss!=0])
+                loss_veff = err(est_veff_for_loss[gt_lwc_for_loss != 0], gt_veff_for_loss[gt_lwc_for_loss != 0])
+                loss_mask = 0.0
+                loss_val += loss_reff + loss_lwc + loss_veff
+            elif cfg.optimizer.loss == 'L2_relative_error_with_mask':
+                est_mask_for_loss = est_mask.flatten()[est_lwc.flatten() > 0]
+                gt_mask_for_loss = gt_mask.flatten()[est_lwc.flatten() > 0]
+                loss_lwc = err(est_lwc_for_loss, gt_lwc_for_loss)/(torch.norm(gt_lwc_for_loss)+ 1e-4)
+                loss_mask = err_BCE(est_mask_for_loss, gt_mask_for_loss)
+                loss_reff = err(est_reff_for_loss[gt_lwc_for_loss != 0],
+                                            gt_reff_for_loss[gt_lwc_for_loss != 0])/(torch.norm(gt_reff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
+                loss_veff = err(est_veff_for_loss[gt_lwc_for_loss != 0],
+                                            gt_veff_for_loss[gt_lwc_for_loss != 0])/(torch.norm(gt_veff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
+                loss_val += loss_reff + loss_lwc + loss_veff + loss_mask
+            else:
+                NotImplementedError()
+
+            relative_err_lwc += relative_error(ext_est=est_lwc,ext_gt=gt_lwc).item()
+            relative_mass_err_lwc += mass_error(ext_est=est_lwc,ext_gt=gt_lwc).item()
+
+            relative_err_reff += relative_error(ext_est=est_reff[gt_lwc!=0],ext_gt=gt_reff[gt_lwc!=0]).item()
+            relative_mass_err_reff += mass_error(ext_est=est_reff[gt_lwc!=0],ext_gt=gt_reff[gt_lwc!=0]).item()
+
+            relative_err_veff += relative_error(ext_est=est_veff, ext_gt=gt_veff).item()
+            relative_mass_err_veff += mass_error(ext_est=est_veff, ext_gt=gt_veff).item()
+
+            bce_err_mask += loss_mask
+
+            if writer:
+                writer._iter = iteration
+                writer._dataset = 'val'  # .format(val_i)
+                if val_i in val_scatter_ind:
+                    writer.monitor_scatter_plot(est_lwc, gt_lwc, ind=val_i, dilute_percent=1, name='lwc')
+                    writer.monitor_scatter_plot(est_reff[gt_lwc!=0], gt_reff[gt_lwc!=0],ind=val_i,dilute_percent=1,name='reff')
+                    writer.monitor_scatter_plot(est_veff, gt_veff, ind=val_i,dilute_percent=1, name='veff_reff',
+                                                        colorbar_param=gt_reff, colorbar_name='gt_reff')
+                    writer.monitor_scatter_plot(est_veff, gt_veff, ind=val_i,dilute_percent=1, name='veff_height',
+                                                        colorbar_param=gt_height, colorbar_name='gt_height')
+
+
+    loss_val /= (val_i + 1)
+    relative_err_lwc /= (val_i + 1)
+    relative_mass_err_lwc /= (val_i+1)
+
+    relative_err_reff /= (val_i + 1)
+    relative_mass_err_reff /= (val_i+1)
+
+    relative_err_veff /= (val_i + 1)
+    relative_mass_err_veff /= (val_i + 1)
+
+    bce_err_mask /= (val_i + 1)
+
+    # Update stats with the validation metrics.
+    stats.update({"loss": float(loss_val), "loss_bce": float(bce_err_mask), "relative_error_lwc": float(relative_err_lwc),
+                              "relative_error_reff": float(relative_err_reff),
+                              "relative_error_veff": float(relative_err_veff),}, stat_set="val")
+
+    if writer:
+        writer._iter = iteration
+        writer._dataset = 'val'#.format(val_i)
+        writer.monitor_loss(float(loss_val))
+        if "mask" in cfg.optimizer.loss:
+            writer.monitor_loss(float(bce_err_mask), title='loss_bce')
+        writer.monitor_scatterer_error(relative_mass_err_lwc, relative_err_lwc, 'lwc')
+        writer.monitor_scatterer_error(relative_mass_err_reff, relative_err_reff, 'reff')
+        writer.monitor_scatterer_error(relative_mass_err_veff, relative_err_veff, 'veff')
+                    # writer.monitor_images(val_image)
+
+    stats.print(stat_set="val")
+
+
+
+                # Set the model back to train mode.
+    model.train()
 
 
 if __name__ == "__main__":
