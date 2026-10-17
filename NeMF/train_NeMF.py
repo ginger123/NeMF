@@ -240,7 +240,7 @@ def main(cfg: DictConfig):
                 loss_veff = [err(est.squeeze()[gt_lwc[i].squeeze()!=0],gt.squeeze()[gt_lwc[i].squeeze()!=0])/(torch.norm(gt.squeeze()[gt_lwc[i].squeeze()!=0])+ 1e-4) for i,(est, gt) in enumerate(zip(est_veff, gt_veff))]
                 loss = torch.mean(torch.stack(loss_reff)) + torch.mean(torch.stack(loss_lwc)) + torch.mean(torch.stack(loss_veff)) + torch.mean(torch.stack(loss_mask))
             else:
-                NotImplementedError()
+                raise NotImplementedError()
 
             # Take the training step.
             loss.backward()
@@ -330,7 +330,8 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
     relative_err_veff = 0
     relative_mass_err_veff = 0
 
-    val_i = 0
+    # Count only evaluated samples instead of using len()
+    n_valid = 0
     for val_i, val_batch in enumerate(val_dataloader):
         val_image, microphysics, grid, image_sizes, projection_matrix, camera_center, masks = val_batch
         val_image = torch.tensor(val_image, device=device).float()
@@ -341,6 +342,7 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
 
         if torch.sum(torch.tensor([(mask).sum() if mask is not None else mask for mask in masks])) == 0:
             continue
+        n_valid += 1
         # Activate eval mode of the model (lets us do a full rendering pass).
         model.eval()
         with torch.no_grad():
@@ -363,7 +365,7 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
                 for est_vol, out_vol, m in zip(est_vols, val_out["output"], val_out['query_indices']):
                     est_vol = est_vol.reshape(est_vols.shape[1],-1)
                     est_vol[:,m] = out_vol.T  # .reshape(m.shape)[m]
-            assert len(est_vols)==1 ##TODO support validation with batch larger than 1
+            assert len(est_vols)==1 # TODO support validation with batch larger than 1
             gt_vol = val_volume.extinctions[0].squeeze()
             est_vols = est_vols.squeeze()
 
@@ -415,7 +417,7 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
                                             gt_veff_for_loss[gt_lwc_for_loss != 0])/(torch.norm(gt_veff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
                 loss_val += loss_reff + loss_lwc + loss_veff + loss_mask
             else:
-                NotImplementedError()
+                raise NotImplementedError()
 
             relative_err_lwc += relative_error(ext_est=est_lwc,ext_gt=gt_lwc).item()
             relative_mass_err_lwc += mass_error(ext_est=est_lwc,ext_gt=gt_lwc).item()
@@ -440,17 +442,22 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
                                                         colorbar_param=gt_height, colorbar_name='gt_height')
 
 
-    loss_val /= (val_i + 1)
-    relative_err_lwc /= (val_i + 1)
-    relative_mass_err_lwc /= (val_i+1)
+    if n_valid == 0:
+        warnings.warn("Validation skipped: every validation sample had an empty mask.")
+        model.train()
+        return
 
-    relative_err_reff /= (val_i + 1)
-    relative_mass_err_reff /= (val_i+1)
+    loss_val /= n_valid
+    relative_err_lwc /= n_valid
+    relative_mass_err_lwc /= n_valid
 
-    relative_err_veff /= (val_i + 1)
-    relative_mass_err_veff /= (val_i + 1)
+    relative_err_reff /= n_valid
+    relative_mass_err_reff /= n_valid
 
-    bce_err_mask /= (val_i + 1)
+    relative_err_veff /= n_valid
+    relative_mass_err_veff /= n_valid
+
+    bce_err_mask /= n_valid
 
     # Update stats with the validation metrics.
     stats.update({"loss": float(loss_val), "loss_bce": float(bce_err_mask), "relative_error_lwc": float(relative_err_lwc),
