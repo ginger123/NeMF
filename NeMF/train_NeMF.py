@@ -75,6 +75,8 @@ def main(cfg: DictConfig):
     lr_scheduler_state_dict = None
     start_epoch = 0
     start_iteration = -1
+    best_val_loss = float("inf")
+    best_val_path = None
 
     #
     log_dir = os.getcwd()
@@ -99,6 +101,7 @@ def main(cfg: DictConfig):
         # Note: stats.epoch counts print intervals, not dataloader epochs.
         start_epoch = loaded_data.get("epoch", 0)
         start_iteration = loaded_data.get("iteration", -1)
+        best_val_loss = loaded_data.get("best_val_loss", float("inf"))
         print(f"   => resuming from iteration {start_iteration}, epoch {start_epoch}.")
 
     init_lr = cfg.optimizer.lr
@@ -114,7 +117,7 @@ def main(cfg: DictConfig):
     if stats is None:
         if "mask" in cfg.optimizer.loss:
             stats = Stats(
-                ["loss", "loss_bce", "relative_error_lwc", "relative_error_reff", "relative_error_veff", "lr", "max_memory", "sec/it"],
+                ["loss", "loss_bce", "mask_f1", "mask_thr", "relative_error_lwc", "relative_error_reff", "relative_error_veff", "lr", "max_memory", "sec/it"],
             )
         else:
             stats = Stats(
@@ -160,6 +163,8 @@ def main(cfg: DictConfig):
     )
     err = torch.nn.MSELoss()
     err_BCE = torch.nn.BCELoss()
+    # Label smoothing for the training BCE target; 0 disables it.
+    bce_smoothing = cfg.optimizer.get("bce_label_smoothing", 0.0)
 
     # Set the model to the training mode.
     model.train().float()
@@ -226,7 +231,7 @@ def main(cfg: DictConfig):
                 loss = torch.mean(torch.stack(loss_reff)) + torch.mean(torch.stack(loss_lwc)) + torch.mean(torch.stack(loss_veff))
                 loss_mask = (torch.tensor(0.0),torch.tensor(0.0))
             elif cfg.optimizer.loss == 'L2_relative_error_with_mask':
-                loss_mask = [err_BCE(est.squeeze(),gt.squeeze()) for est, gt in zip(est_mask, gt_mask)]
+                loss_mask = [err_BCE(est.squeeze(), (gt * (1 - bce_smoothing) + 0.5 * bce_smoothing).squeeze()) for est, gt in zip(est_mask, gt_mask)]
                 loss_lwc = [err(est.squeeze(),gt.squeeze())/(torch.norm(gt.squeeze())+ 1e-4) for est, gt in zip(est_lwc, gt_lwc)]
                 loss_reff = [err(est.squeeze()[gt_lwc[i].squeeze()!=0],gt.squeeze()[gt_lwc[i].squeeze()!=0])/(torch.norm(gt.squeeze()[gt_lwc[i].squeeze()!=0])+ 1e-4) for i,(est, gt) in enumerate(zip(est_reff, gt_reff))]
                 loss_veff = [err(est.squeeze()[gt_lwc[i].squeeze()!=0],gt.squeeze()[gt_lwc[i].squeeze()!=0])/(torch.norm(gt.squeeze()[gt_lwc[i].squeeze()!=0])+ 1e-4) for i,(est, gt) in enumerate(zip(est_veff, gt_veff))]
@@ -299,7 +304,15 @@ def main(cfg: DictConfig):
 
             # Validation
             if iteration % cfg.validation_iter_interval == 0 and iteration > 0:
-                run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_BCE, iteration, val_scatter_ind)
+                val_loss = run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_BCE, iteration, val_scatter_ind)
+                # Keep only the checkpoint with the lowest validation loss so far.
+                if val_loss is not None and val_loss < best_val_loss and len(checkpoint_dir) > 0:
+                    best_val_loss = val_loss
+                    if best_val_path is not None and os.path.isfile(best_val_path):
+                        os.remove(best_val_path)
+                    best_val_path = os.path.join(checkpoint_dir, f'best_val_cp_{iteration}.pth')
+                    print(f"New best validation loss {val_loss:.5f}, storing {best_val_path}.")
+                    save_checkpoint(best_val_path, model, optimizer, lr_scheduler, stats, iteration, epoch, best_val_loss)
 
             # Checkpoint.
             if (
@@ -309,17 +322,35 @@ def main(cfg: DictConfig):
             ):
                 curr_checkpoint_path = os.path.join(checkpoint_dir,f'cp_{iteration}.pth')
                 print(f"Storing checkpoint {curr_checkpoint_path}.")
-                data_to_store = {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                    "stats": pickle.dumps(stats),
-                    "iteration": iteration,
-                    "epoch": epoch,
-                }
-                torch.save(data_to_store, curr_checkpoint_path)
+                save_checkpoint(curr_checkpoint_path, model, optimizer, lr_scheduler, stats, iteration, epoch, best_val_loss)
+
+def save_checkpoint(path, model, optimizer, lr_scheduler, stats, iteration, epoch, best_val_loss):
+    """Store everything needed to resume training (or to load the model in test_NeMF.py)."""
+    torch.save({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "lr_scheduler": lr_scheduler.state_dict(),
+        "stats": pickle.dumps(stats),
+        "iteration": iteration,
+        "epoch": epoch,
+        "best_val_loss": best_val_loss,
+    }, path)
+
+def mask_f1_per_threshold(est_mask, gt_mask, thr_vec):
+    """F1 of (est_mask > thr) vs gt_mask for every thr in thr_vec, shape (len(thr_vec),).
+    Same metric as the threshold choice in test_NeMF.py; an empty/empty sample scores 0."""
+    est_bin = est_mask.flatten()[None, :] > thr_vec[:, None]
+    gt = gt_mask.flatten()[None, :]
+    tp = (est_bin & gt).sum(1)
+    fp = (est_bin & ~gt).sum(1)
+    fn = (~est_bin & gt).sum(1)
+    return 2 * tp / (2 * tp + fp + fn).clamp_min(1)
 
 def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_BCE, iteration, val_scatter_ind):
+    use_mask = "mask" in cfg.optimizer.loss
+    # Mask F1 threshold sweep, same grid as test_NeMF.py.
+    thr_vec = torch.linspace(0, 1, 50, device=device)
+    f1_per_thr = []
     loss_val = 0
     bce_err_mask = 0
     relative_err_lwc= 0
@@ -367,6 +398,10 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
             assert len(est_vols)==1 # TODO support validation with batch larger than 1
             gt_vol = val_volume.extinctions[0].squeeze()
             est_vols = est_vols.squeeze()
+
+            if use_mask:
+                # Full grid like test: voxels outside the queried region are predicted 0.
+                f1_per_thr.append(mask_f1_per_threshold(est_vols[1], gt_vol[0] > 0, thr_vec))
 
             if "mask" in cfg.optimizer.loss:
                 est_lwc = est_vols[0][est_vols[0]!=0]
@@ -444,7 +479,7 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
     if n_valid == 0:
         warnings.warn("Validation skipped: every validation sample had an empty mask.")
         model.train()
-        return
+        return None
 
     loss_val /= n_valid
     relative_err_lwc /= n_valid
@@ -459,9 +494,17 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
     bce_err_mask /= n_valid
 
     # Update stats with the validation metrics.
-    stats.update({"loss": float(loss_val), "loss_bce": float(bce_err_mask), "relative_error_lwc": float(relative_err_lwc),
+    val_metrics = {"loss": float(loss_val), "loss_bce": float(bce_err_mask), "relative_error_lwc": float(relative_err_lwc),
                               "relative_error_reff": float(relative_err_reff),
-                              "relative_error_veff": float(relative_err_veff),}, stat_set="val")
+                              "relative_error_veff": float(relative_err_veff),}
+    if use_mask:
+        # Mean F1 over samples per threshold, then the best threshold (as in test_NeMF.py).
+        mean_f1 = torch.stack(f1_per_thr).mean(0)
+        best = mean_f1.argmax()
+        mask_f1 = float(mean_f1[best])
+        mask_thr = float(thr_vec[best])
+        val_metrics.update({"mask_f1": mask_f1, "mask_thr": mask_thr})
+    stats.update(val_metrics, stat_set="val")
 
     if writer:
         writer._iter = iteration
@@ -469,6 +512,8 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
         writer.monitor_loss(float(loss_val))
         if "mask" in cfg.optimizer.loss:
             writer.monitor_loss(float(bce_err_mask), title='loss_bce')
+            writer.monitor_loss(mask_f1, title='mask_f1')
+            writer.monitor_loss(mask_thr, title='mask_thr')
         writer.monitor_scatterer_error(relative_mass_err_lwc, relative_err_lwc, 'lwc')
         writer.monitor_scatterer_error(relative_mass_err_reff, relative_err_reff, 'reff')
         writer.monitor_scatterer_error(relative_mass_err_veff, relative_err_veff, 'veff')
@@ -480,6 +525,7 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
 
                 # Set the model back to train mode.
     model.train()
+    return float(loss_val)
 
 
 if __name__ == "__main__":
