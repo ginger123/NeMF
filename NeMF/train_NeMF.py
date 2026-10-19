@@ -45,6 +45,11 @@ def main(cfg: DictConfig):
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
+    # Speed: allow TF32 tensor cores for matmuls/convs (Ampere+ GPUs) and let
+    # cuDNN autotune the fastest conv algorithm for the (fixed) image size.
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     # Device on which to run.
     if torch.cuda.is_available() and cfg.debug == False:
@@ -292,15 +297,18 @@ def main(cfg: DictConfig):
                     # was moved here for optimization. It now reads the z coordinate of
                     # the queried voxels directly, which is exact (the search gave all
                     # zero-valued voxels the height of the first zero voxel).
+
+                    # TODO: move to different interval, for now use with flag
                     gt_height = [points[:, 2] for points in out["query_points"]]
-                    for ind in range(len(out["output"])):
-                        writer.monitor_scatter_plot(est_lwc[ind], gt_lwc[ind],ind=ind,name='lwc')
-                        writer.monitor_scatter_plot(est_reff[ind][gt_lwc[ind]!=0], gt_reff[ind][gt_lwc[ind]!=0],ind=ind,name='reff')
-                        writer.monitor_scatter_plot(est_veff[ind], gt_veff[ind], ind=ind, name='veff_reff',
-                                                    colorbar_param = gt_reff[ind], colorbar_name = 'gt_reff')
-                        writer.monitor_scatter_plot(est_veff[ind], gt_veff[ind], ind=ind, name='veff_height',
-                                                    colorbar_param=gt_height[ind], colorbar_name='gt_height')
-                    # writer.monitor_images(images)
+                    if cfg.plot_graphs:
+                        for ind in range(len(out["output"])):
+                            writer.monitor_scatter_plot(est_lwc[ind], gt_lwc[ind],ind=ind,name='lwc')
+                            writer.monitor_scatter_plot(est_reff[ind][gt_lwc[ind]!=0], gt_reff[ind][gt_lwc[ind]!=0],ind=ind,name='reff')
+                            writer.monitor_scatter_plot(est_veff[ind], gt_veff[ind], ind=ind, name='veff_reff',
+                                                        colorbar_param = gt_reff[ind], colorbar_name = 'gt_reff')
+                            writer.monitor_scatter_plot(est_veff[ind], gt_veff[ind], ind=ind, name='veff_height',
+                                                        colorbar_param=gt_height[ind], colorbar_name='gt_height')
+                        # writer.monitor_images(images)
 
             # Validation
             if iteration % cfg.validation_iter_interval == 0 and iteration > 0:

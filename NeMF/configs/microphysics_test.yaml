@@ -1,6 +1,6 @@
 hydra:
   run:
-    dir: /home/inbalkom/NN_outputs/test/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ./NN_outputs/test/${now:%Y-%m-%d}/${now:%H-%M-%S}
 seed: 3
 debug: False
 gpu: 0
