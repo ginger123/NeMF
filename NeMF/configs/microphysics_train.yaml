@@ -1,6 +1,6 @@
 hydra:
   run:
-    dir: /wdata_visl/aariel/NN_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: /wdata_visl/aariel/NN_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-mosaic0
 comment: 'a'
 seed: 3
 debug: False
@@ -22,13 +22,16 @@ data:
   percent_val: None
   n_cam: 10
   rand_cam: False
+  stokes_input: True  # images on disk are Stokes (I, Q, U): convert to mosaicked raw pixels. False: use them as stored
   image_size: None
-  mean: [ 0.02308033, -0.00048947,  0.00056993] 
+  mean: [0.011540064641113254]
   # CASS 10 images: [0.02267, -1.3454e-4, -2.4774e-4]
   # BOMEX 10 images: [ 0.02308033, -0.00048947,  0.00056993]
-  std: [0.01007978, 0.00110006, 0.00160427] 
+  # BOMEX 10 images mosaic: [0.011540064641113254]
+  std: [0.005093103709037546]
   # CASS 10 images: [0.01188, 7.4005e-4, 1.82997e-3] 
   # BOMEX 10 images: [0.01007978, 0.00110006, 0.00160427]
+  # BOMEX 10 images mosaic: [0.005093103709037546]
 optimizer:
   max_epochs: 100000
   lr: 1.0e-05
@@ -69,7 +72,7 @@ backbone:
   sampling_support: 3
   sampling_output_size: 9
   out_channels: 128
-  in_channels: 3
+  in_channels: 1
   n_sampling_nets: 10
   feature_flatten: False
   modify_first_layer: True

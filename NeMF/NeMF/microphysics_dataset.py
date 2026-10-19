@@ -36,6 +36,13 @@ import scipy.io as sio
 
 ALL_DATASETS = ("BOMEX_polarization_pyshdom_varying_M","CASS_10cams_20m_polarization_pyshdom","BOMEX_500CCN_10cams_20m_polarization_pyshdom")
 
+# 2x2 polarizer super-pixel, as row indices into G (0: 0deg, 1: 45deg, 2: 90deg, 3: 135deg).
+# Sony IMX250MZR layout: [[90, 45], [135, 0]].
+# TODO: find correct tiling sequence for cloudCT camera
+MOSAIC_PATTERN = np.array([[2, 1], [3, 0]])
+# G matrix for polarized pixel<->stokes vector
+G = 0.5 * np.array([[1, 1, 0], [1, 0, 1], [1, -1, 0], [1, 0, -1]])
+
 
 def trivial_collate(batch):
     """
@@ -83,6 +90,9 @@ def get_cloud_microphysics_datasets(cfg):
     mean = cfg.data.mean
     std = cfg.data.std
     rand_cam = cfg.data.rand_cam
+    # True: images on disk are Stokes vectors (I, Q, U) and get converted to mosaicked raw pixels.
+    # False: images are used as stored. Older configs lack the key and keep their original behaviour.
+    stokes_input = cfg.data.get("stokes_input", False)
     train_dataset = MicrophysicsCloudDataset(
             data_train_paths,
         n_cam=n_cam,
@@ -91,24 +101,26 @@ def get_cloud_microphysics_datasets(cfg):
         mean=mean,
         std=std,
         dataset_name = dataset_name,
+        stokes_input=stokes_input,
     )
 
     val_paths = [f for f in glob.glob(os.path.join(data_root, "validation/cloud*.pkl"))]
     val_len = cfg.data.n_val if cfg.data.n_val > 0 else len(val_paths)
     val_paths = val_paths[:val_len]
     val_dataset = MicrophysicsCloudDataset(val_paths, n_cam=n_cam,
-        rand_cam = rand_cam, mask_type=cfg.ct_net.val_mask_type, mean=mean, std=std,   dataset_name = dataset_name)
+        rand_cam = rand_cam, mask_type=cfg.ct_net.val_mask_type, mean=mean, std=std,   dataset_name = dataset_name,
+        stokes_input=stokes_input)
 
     test_paths = [f for f in glob.glob(os.path.join(data_root, "test/cloud*.pkl"))]
     test_dataset = MicrophysicsCloudDataset(test_paths, n_cam=n_cam,
                                           rand_cam=rand_cam, mask_type=cfg.ct_net.val_mask_type, mean=mean, std=std,
-                                          dataset_name=dataset_name)
+                                          dataset_name=dataset_name, stokes_input=stokes_input)
 
     return train_dataset, val_dataset, test_dataset
 
 
 class MicrophysicsCloudDataset(Dataset):
-    def __init__(self, cloud_dir, n_cam, rand_cam=False, transform=None, target_transform=None, mask_type=None, mean=0, std=1, dataset_name=''):
+    def __init__(self, cloud_dir, n_cam, rand_cam=False, transform=None, target_transform=None, mask_type=None, mean=0, std=1, dataset_name='', stokes_input=False):
         self.cloud_dir = cloud_dir
         self.transform = transform
         self.target_transform = target_transform
@@ -118,6 +130,7 @@ class MicrophysicsCloudDataset(Dataset):
         self.mean = mean
         self.std = std
         self.dataset_name = dataset_name
+        self.stokes_input = stokes_input
 
     def __len__(self):
         return len(self.cloud_dir)
@@ -152,8 +165,16 @@ class MicrophysicsCloudDataset(Dataset):
             images = np.squeeze(images[:,cam_i,:,:,:])
         else:
             images = images[cam_i, :, :, :]
-        images -= np.array(self.mean).reshape((1,3,1,1))
-        images /= np.array(self.std).reshape((1,3,1,1))
+        if self.stokes_input:
+            images = self.stokes_to_camera_pixels(images)
+
+        # normalize what the network actually sees; mean/std hold one value per output channel
+        # (compute them with NeMF/util/get_mean_std.py)
+        mean = np.array(self.mean).reshape((1,-1,1,1))
+        std = np.array(self.std).reshape((1,-1,1,1))
+        assert mean.shape[1] in (1, images.shape[1]) and std.shape[1] in (1, images.shape[1]), \
+            f"data.mean/std have {mean.shape[1]}/{std.shape[1]} values but images have {images.shape[1]} channels"
+        images = (images - mean) / std
 
         microphysics = np.array([data['lwc_gt'],data['reff_gt'],data['veff_gt']])
 
@@ -170,3 +191,18 @@ class MicrophysicsCloudDataset(Dataset):
         grid = data['grid']
 
         return images, microphysics, grid, image_sizes, projection_matrix, camera_center, mask
+
+    def stokes_to_camera_pixels(self, images):
+        # images shape is (n_cam, 3, H, W) holding the Stokes vector (I, Q, U)
+        n_cam, _, H, W = images.shape
+        #  move channels to the last axis and reshape for matrix mult
+        images_transposed = np.moveaxis(images, 1, -1).reshape(-1, 3)
+
+        # radiance behind a polarizer at angles = 0, 45, 90, 135 degrees: I_measured = G @ y_s
+        measured = images_transposed @ G.T
+        # undo the reshape and move the channel axis back: (n_cam, 4, H, W)
+        measured = np.moveaxis(measured.reshape(n_cam, H, W, 4), -1, 1)
+
+        # mosaic: each pixel keeps only the polarizer angle it sits behind
+        angle_idx = np.tile(MOSAIC_PATTERN, (H // 2 + 1, W // 2 + 1))[:H, :W]
+        return np.take_along_axis(measured, angle_idx[None, None], axis=1)  # (n_cam, 1, H, W)
