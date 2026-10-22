@@ -390,39 +390,45 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
                             val_volume,
                             masks,
                         )
-            if "mask" in cfg.optimizer.loss:
+            # extinctions.shape is (batch, property dim, Nx, Ny, Nz)
+            if use_mask:
                 gt_shape = val_volume.extinctions.shape
                 est_vols = torch.zeros((gt_shape[0], gt_shape[1] + 1, gt_shape[2], gt_shape[3], gt_shape[4]),
                                                    device=val_volume.device)  # plus 1 for mask
             else:
                 est_vols = torch.zeros(val_volume.extinctions.shape, device=val_volume.device)
-            if val_out['query_indices'] is None:
-                for i, (out_vol, m) in enumerate(zip(val_out["output"], masks)):
-                    est_vols[i][m.squeeze(0)] = out_vol.squeeze(1)
-            else:
-                for est_vol, out_vol, m in zip(est_vols, val_out["output"], val_out['query_indices']):
-                    est_vol = est_vol.reshape(est_vols.shape[1],-1)
-                    est_vol[:,m] = out_vol.T  # .reshape(m.shape)[m]
+
+
+            # we always have val_out['query_indices'] in validation, Nq=len(val_out['query_indices'])
+            # est_vols shape is (B, 4, Nx, Ny, Nz) and B==1 (so the for loop runs once)
+            for est_vol, out_vol, m in zip(est_vols, val_out["output"], val_out['query_indices']):
+                est_vol = est_vol.reshape(est_vols.shape[1],-1) # (4, Nx, Ny, Nz) -> (4, Nq)
+                # out_vol shape is (Nq, 4)
+                est_vol[:,m] = out_vol.T  # write the inference results to est_vol
+
+            # remove the batch dimension since only B==1 is supported
             assert len(est_vols)==1 # TODO support validation with batch larger than 1
             gt_vol = val_volume.extinctions[0].squeeze()
             est_vols = est_vols.squeeze()
+
+            queried_indices = (est_vols[0]!=0)
 
             if use_mask:
                 # Full grid like test: voxels outside the queried region are predicted 0.
                 f1_per_thr.append(mask_f1_per_threshold(est_vols[1], gt_vol[0] > 0, thr_vec))
 
             if "mask" in cfg.optimizer.loss:
-                est_lwc = est_vols[0][est_vols[0]!=0]
-                est_mask = est_vols[1][est_vols[0]!=0]
-                est_reff = est_vols[2][est_vols[0]!=0]
-                est_veff = est_vols[3][est_vols[0]!=0]
+                est_lwc = est_vols[0][queried_indices]
+                est_mask = est_vols[1][queried_indices]
+                est_reff = est_vols[2][queried_indices]
+                est_veff = est_vols[3][queried_indices]
 
-                gt_lwc = gt_vol[0][est_vols[0]!=0]
+                gt_lwc = gt_vol[0][queried_indices]
                 gt_mask = ((gt_lwc>0).float())
-                gt_reff = gt_vol[1][est_vols[0]!=0]
-                gt_veff = gt_vol[2][est_vols[0]!=0]
+                gt_reff = gt_vol[1][queried_indices]
+                gt_veff = gt_vol[2][queried_indices]
                 gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32), device=val_volume.device).repeat(gt_vol[0].shape[0], gt_vol[0].shape[1], 1)
-                gt_height = gt_height[est_vols[0]!=0]
+                gt_height = gt_height[queried_indices]
             else:
                 est_lwc = est_vols[0]
                 est_reff = est_vols[1]
@@ -518,7 +524,7 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
         writer._iter = iteration
         writer._dataset = 'val'#.format(val_i)
         writer.monitor_loss(float(loss_val))
-        if "mask" in cfg.optimizer.loss:
+        if use_mask:
             writer.monitor_loss(float(bce_err_mask), title='loss_bce')
             writer.monitor_loss(mask_f1, title='mask_f1')
             writer.monitor_loss(mask_thr, title='mask_thr')

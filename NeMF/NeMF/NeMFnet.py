@@ -275,7 +275,7 @@ class NeMFnetAirMSPI(torch.nn.Module):
 
         if self.training:
             if self.use_neighbours:
-                NotImplementedError()
+                raise NotImplementedError()
             else:
                 volume, query_points, query_indices = volume.get_query_points_microphysics(self.n_query, self.query_point_method, masks = masks)
         else:
