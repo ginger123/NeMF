@@ -367,6 +367,11 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
     relative_mass_err_reff = 0
     relative_err_veff = 0
     relative_mass_err_veff = 0
+    # Off by default; .get so older run configs without the key still work.
+    bce_diagnostics = use_mask and cfg.get("bce_diagnostics", False)
+    bce_cloud, n_bce_cloud = 0, 0
+    bce_clear, n_bce_clear = 0, 0
+    lwc_pos_frac = 0
 
     # Count only evaluated samples instead of using len()
     n_valid = 0
@@ -402,7 +407,7 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
             # we always have val_out['query_indices'] in validation, Nq=len(val_out['query_indices'])
             # est_vols shape is (B, 4, Nx, Ny, Nz) and B==1 (so the for loop runs once)
             for est_vol, out_vol, m in zip(est_vols, val_out["output"], val_out['query_indices']):
-                est_vol = est_vol.reshape(est_vols.shape[1],-1) # (4, Nx, Ny, Nz) -> (4, Nq)
+                est_vol = est_vol.reshape(est_vols.shape[1],-1) # (4, Nx, Ny, Nz) -> (4, Nx*Ny*Nz), a view of est_vols
                 # out_vol shape is (Nq, 4)
                 est_vol[:,m] = out_vol.T  # write the inference results to est_vol
 
@@ -411,70 +416,64 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
             gt_vol = val_volume.extinctions[0].squeeze()
             est_vols = est_vols.squeeze()
 
-            queried_indices = (est_vols[0]!=0)
+            # The voxels the model was queried on, i.e. the dataset's val mask (space carving in the current config).
+            # Built from the indices, not from est_vols != 0, so a prediction of exactly 0 can't drop a voxel.
+            space_carving_mask = torch.zeros(est_vols[0].numel(), dtype=torch.bool, device=est_vols.device)
+            space_carving_mask[val_out['query_indices'][0]] = True
+            space_carving_mask = space_carving_mask.view_as(est_vols[0])
 
             if use_mask:
                 # Full grid like test: voxels outside the queried region are predicted 0.
                 f1_per_thr.append(mask_f1_per_threshold(est_vols[1], gt_vol[0] > 0, thr_vec))
 
-            if "mask" in cfg.optimizer.loss:
-                est_lwc = est_vols[0][queried_indices]
-                est_mask = est_vols[1][queried_indices]
-                est_reff = est_vols[2][queried_indices]
-                est_veff = est_vols[3][queried_indices]
-
-                gt_lwc = gt_vol[0][queried_indices]
-                gt_mask = ((gt_lwc>0).float())
-                gt_reff = gt_vol[1][queried_indices]
-                gt_veff = gt_vol[2][queried_indices]
-                gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32), device=val_volume.device).repeat(gt_vol[0].shape[0], gt_vol[0].shape[1], 1)
-                gt_height = gt_height[queried_indices]
+            # All losses and metrics use every queried voxel (the region training samples from),
+            # not only voxels with predicted LWC > 0 (that subset biased BCE upward, see summary.md).
+            est = est_vols[:, space_carving_mask]  # (C_est, Nq)
+            if use_mask:
+                est_lwc, est_mask, est_reff, est_veff = est
             else:
-                est_lwc = est_vols[0]
-                est_reff = est_vols[1]
-                est_veff = est_vols[2]
-
-                gt_lwc = gt_vol[0]
-                gt_reff = gt_vol[1]
-                gt_veff = gt_vol[2]
-                gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32), device=val_volume.device).repeat(gt_lwc.shape[0], gt_lwc.shape[1], 1)
-
-
-            est_lwc_for_loss = est_lwc.flatten()[est_lwc.flatten() > 0]
-            gt_lwc_for_loss = gt_lwc.flatten()[est_lwc.flatten() > 0]
-            est_reff_for_loss = est_reff.flatten()[est_lwc.flatten() > 0]
-            gt_reff_for_loss = gt_reff.flatten()[est_lwc.flatten() > 0]
-            est_veff_for_loss = est_veff.flatten()[est_lwc.flatten() > 0]
-            gt_veff_for_loss = gt_veff.flatten()[est_lwc.flatten() > 0]
+                est_lwc, est_reff, est_veff = est
+            gt_lwc, gt_reff, gt_veff = gt_vol[:, space_carving_mask]  # (3, Nq)
+            cloud = gt_lwc > 0
+            gt_mask = cloud.float()
+            gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32), device=val_volume.device).repeat(gt_vol[0].shape[0], gt_vol[0].shape[1], 1)
+            gt_height = gt_height[space_carving_mask]
+            # Clamp like test_NeMF.py: negative LWC counts as 0, so missed cloud and false cloud both count.
+            est_lwc = est_lwc.clamp_min(0)
 
             if cfg.optimizer.loss == 'L2_relative_error':
-                loss_lwc = err(est_lwc_for_loss, gt_lwc_for_loss)
-                            #loss_reff = err(est_reff_for_loss/(gt_veff_for_loss+1e-4), gt_reff_for_loss/(gt_veff_for_loss+1e-4))
-                loss_reff = err(est_reff_for_loss[gt_lwc_for_loss!=0], gt_reff_for_loss[gt_lwc_for_loss!=0])
-                loss_veff = err(est_veff_for_loss[gt_lwc_for_loss != 0], gt_veff_for_loss[gt_lwc_for_loss != 0])
+                loss_lwc = err(est_lwc, gt_lwc)
+                loss_reff = err(est_reff[cloud], gt_reff[cloud])
+                loss_veff = err(est_veff[cloud], gt_veff[cloud])
                 loss_mask = 0.0
                 loss_val += loss_reff + loss_lwc + loss_veff
             elif cfg.optimizer.loss == 'L2_relative_error_with_mask':
-                est_mask_for_loss = est_mask.flatten()[est_lwc.flatten() > 0]
-                gt_mask_for_loss = gt_mask.flatten()[est_lwc.flatten() > 0]
-                loss_lwc = err(est_lwc_for_loss, gt_lwc_for_loss)/(torch.norm(gt_lwc_for_loss)+ 1e-4)
-                loss_mask = err_BCE(est_mask_for_loss, gt_mask_for_loss)
-                loss_reff = err(est_reff_for_loss[gt_lwc_for_loss != 0],
-                                            gt_reff_for_loss[gt_lwc_for_loss != 0])/(torch.norm(gt_reff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
-                loss_veff = err(est_veff_for_loss[gt_lwc_for_loss != 0],
-                                            gt_veff_for_loss[gt_lwc_for_loss != 0])/(torch.norm(gt_veff_for_loss[gt_lwc_for_loss != 0])+ 1e-4)
+                loss_lwc = err(est_lwc, gt_lwc)/(torch.norm(gt_lwc)+ 1e-4)
+                # Hard labels (no smoothing), so runs with and without bce_label_smoothing compare.
+                loss_mask = err_BCE(est_mask, gt_mask)
+                loss_reff = err(est_reff[cloud], gt_reff[cloud])/(torch.norm(gt_reff[cloud])+ 1e-4)
+                loss_veff = err(est_veff[cloud], gt_veff[cloud])/(torch.norm(gt_veff[cloud])+ 1e-4)
                 loss_val += loss_reff + loss_lwc + loss_veff + loss_mask
+                # Diagnostics: where the BCE comes from, and how much of the region the LWC head calls cloud.
+                if bce_diagnostics:
+                    if cloud.any():
+                        bce_cloud += err_BCE(est_mask[cloud], gt_mask[cloud]).item()
+                        n_bce_cloud += 1
+                    if (~cloud).any():
+                        bce_clear += err_BCE(est_mask[~cloud], gt_mask[~cloud]).item()
+                        n_bce_clear += 1
+                    lwc_pos_frac += (est_vols[0][space_carving_mask] > 0).float().mean().item()
             else:
                 raise NotImplementedError()
 
             relative_err_lwc += relative_error(ext_est=est_lwc,ext_gt=gt_lwc).item()
             relative_mass_err_lwc += mass_error(ext_est=est_lwc,ext_gt=gt_lwc).item()
 
-            relative_err_reff += relative_error(ext_est=est_reff[gt_lwc!=0],ext_gt=gt_reff[gt_lwc!=0]).item()
-            relative_mass_err_reff += mass_error(ext_est=est_reff[gt_lwc!=0],ext_gt=gt_reff[gt_lwc!=0]).item()
+            relative_err_reff += relative_error(ext_est=est_reff[cloud],ext_gt=gt_reff[cloud]).item()
+            relative_mass_err_reff += mass_error(ext_est=est_reff[cloud],ext_gt=gt_reff[cloud]).item()
 
-            relative_err_veff += relative_error(ext_est=est_veff, ext_gt=gt_veff).item()
-            relative_mass_err_veff += mass_error(ext_est=est_veff, ext_gt=gt_veff).item()
+            relative_err_veff += relative_error(ext_est=est_veff[cloud], ext_gt=gt_veff[cloud]).item()
+            relative_mass_err_veff += mass_error(ext_est=est_veff[cloud], ext_gt=gt_veff[cloud]).item()
 
             bce_err_mask += loss_mask
 
@@ -528,6 +527,11 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
             writer.monitor_loss(float(bce_err_mask), title='loss_bce')
             writer.monitor_loss(mask_f1, title='mask_f1')
             writer.monitor_loss(mask_thr, title='mask_thr')
+        if bce_diagnostics:
+            # Note that this are a mean per cloud and not per voxel!
+            writer.monitor_loss(bce_cloud / max(n_bce_cloud, 1), title='loss_bce_cloud')
+            writer.monitor_loss(bce_clear / max(n_bce_clear, 1), title='loss_bce_clear')
+            writer.monitor_loss(lwc_pos_frac / n_valid, title='lwc_pos_frac')
         writer.monitor_scatterer_error(relative_mass_err_lwc, relative_err_lwc, 'lwc')
         writer.monitor_scatterer_error(relative_mass_err_reff, relative_err_reff, 'reff')
         writer.monitor_scatterer_error(relative_mass_err_veff, relative_err_veff, 'veff')
