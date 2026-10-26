@@ -34,6 +34,7 @@ import torch
 # from ignite.handlers.param_scheduler import create_lr_scheduler_with_warmup
 
 relative_error = lambda ext_est, ext_gt, eps=1e-6 : torch.norm(ext_est.view(-1) - ext_gt.view(-1),p=1) / (torch.norm(ext_gt.view(-1),p=1) + eps)
+relative_l2 = lambda ext_est, ext_gt, eps=1e-6 : torch.norm(ext_est.view(-1) - ext_gt.view(-1)) / (torch.norm(ext_gt.view(-1)) + eps)
 mass_error = lambda ext_est, ext_gt, eps=1e-6 : (torch.norm(ext_gt.view(-1),p=1) - torch.norm(ext_est.view(-1),p=1)) / (torch.norm(ext_gt.view(-1),p=1) + eps)
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
 rho_water = 1e6  # g/m^3
@@ -312,7 +313,7 @@ def main(cfg: DictConfig):
 
             # Validation
             if iteration % cfg.validation_iter_interval == 0 and iteration > 0:
-                val_loss = run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_BCE, iteration, val_scatter_ind)
+                val_loss = run_validation(cfg, device, model, stats, writer, val_dataloader, err_BCE, iteration, val_scatter_ind)
                 # Keep only the checkpoint with the lowest validation loss so far.
                 if val_loss is not None and val_loss < best_val_loss and len(checkpoint_dir) > 0:
                     best_val_loss = val_loss
@@ -354,12 +355,15 @@ def mask_f1_per_threshold(est_mask, gt_mask, thr_vec):
     fn = (~est_bin & gt).sum(1)
     return 2 * tp / (2 * tp + fp + fn).clamp_min(1)
 
-def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_BCE, iteration, val_scatter_ind):
+def run_validation(cfg, device, model, stats, writer, val_dataloader, err_BCE, iteration, val_scatter_ind):
     use_mask = "mask" in cfg.optimizer.loss
     # Mask F1 threshold sweep, same grid as test_NeMF.py.
     thr_vec = torch.linspace(0, 1, 50, device=device)
     f1_per_thr = []
     loss_val = 0
+    loss_val_lwc = 0
+    loss_val_reff = 0
+    loss_val_veff = 0
     bce_err_mask = 0
     relative_err_lwc= 0
     relative_mass_err_lwc = 0
@@ -441,19 +445,23 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
             # Clamp like test_NeMF.py: negative LWC counts as 0, so missed cloud and false cloud both count.
             est_lwc = est_lwc.clamp_min(0)
 
+            # Validation loss (selects best_val_cp): relative L2 per property, ||est-gt|| / ||gt||.
+            # The training terms MSE/||gt|| = rel_L2 * ||est-gt||/N keep the property's units and shrink with
+            # cloud size, so their sum mostly weighs the property with the largest values. These don't.
+            # BCE is left out since the scale is different and there are worries of overfit - so we
+            # decide based on f1 score + this loss  together
+            loss_lwc = relative_l2(est_lwc, gt_lwc)
+            loss_reff = relative_l2(est_reff[cloud], gt_reff[cloud])
+            loss_veff = relative_l2(est_veff[cloud], gt_veff[cloud])
+            loss_val += loss_reff + loss_lwc + loss_veff
+            loss_val_lwc += loss_lwc
+            loss_val_reff += loss_reff
+            loss_val_veff += loss_veff
             if cfg.optimizer.loss == 'L2_relative_error':
-                loss_lwc = err(est_lwc, gt_lwc)
-                loss_reff = err(est_reff[cloud], gt_reff[cloud])
-                loss_veff = err(est_veff[cloud], gt_veff[cloud])
                 loss_mask = 0.0
-                loss_val += loss_reff + loss_lwc + loss_veff
             elif cfg.optimizer.loss == 'L2_relative_error_with_mask':
-                loss_lwc = err(est_lwc, gt_lwc)/(torch.norm(gt_lwc)+ 1e-4)
                 # Hard labels (no smoothing), so runs with and without bce_label_smoothing compare.
                 loss_mask = err_BCE(est_mask, gt_mask)
-                loss_reff = err(est_reff[cloud], gt_reff[cloud])/(torch.norm(gt_reff[cloud])+ 1e-4)
-                loss_veff = err(est_veff[cloud], gt_veff[cloud])/(torch.norm(gt_veff[cloud])+ 1e-4)
-                loss_val += loss_reff + loss_lwc + loss_veff + loss_mask
                 # Diagnostics: where the BCE comes from, and how much of the region the LWC head calls cloud.
                 if bce_diagnostics:
                     if cloud.any():
@@ -495,6 +503,9 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
         return None
 
     loss_val /= n_valid
+    loss_val_lwc /= n_valid
+    loss_val_reff /= n_valid
+    loss_val_veff /= n_valid
     relative_err_lwc /= n_valid
     relative_mass_err_lwc /= n_valid
 
@@ -523,6 +534,9 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err, err_B
         writer._iter = iteration
         writer._dataset = 'val'#.format(val_i)
         writer.monitor_loss(float(loss_val))
+        writer.monitor_loss(float(loss_val_lwc), title='loss_lwc')
+        writer.monitor_loss(float(loss_val_reff), title='loss_reff')
+        writer.monitor_loss(float(loss_val_veff), title='loss_veff')
         if use_mask:
             writer.monitor_loss(float(bce_err_mask), title='loss_bce')
             writer.monitor_loss(mask_f1, title='mask_f1')
