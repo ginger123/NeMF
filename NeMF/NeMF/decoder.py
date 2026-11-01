@@ -107,6 +107,8 @@ class Decoder(nn.Module):
 
         elif type == 'microphysics_3heads_with_mask':
 
+            # Shared trunk for LWC and the mask, with a separate output layer each,
+            # so the mask head can get its own optimizer settings (see train_NeMF.py).
             self.decoder0 = nn.Sequential(
                 torch.nn.Linear(latent_size, 2048),
                 torch.nn.ReLU(True),
@@ -116,8 +118,9 @@ class Decoder(nn.Module):
                 2048,  # self.harmonic_embedding.embedding_dim_xyz,
                 512,
                 input_skips=(5,),
-                ),
-                torch.nn.Linear(512, 2*out_size),)
+                ),)
+            self.lwc_head = torch.nn.Linear(512, out_size)
+            self.mask_head = torch.nn.Linear(512, out_size)
             self.decoder1 = nn.Sequential(
                 torch.nn.Linear(latent_size, 2048),
                 torch.nn.ReLU(True),
@@ -152,7 +155,7 @@ class Decoder(nn.Module):
             x = x.reshape(x.shape[0],-1)
         if '3heads_with_mask' in self.type:
             dec0_out = self.decoder0(x)
-            return torch.stack([dec0_out[:,0], torch.sigmoid(dec0_out[:,1]), self.decoder1(x).squeeze(), self.decoder2(x).squeeze()], dim=-1)
+            return torch.stack([self.lwc_head(dec0_out)[:,0], torch.sigmoid(self.mask_head(dec0_out)[:,0]), self.decoder1(x).squeeze(), self.decoder2(x).squeeze()], dim=-1)
         elif '3heads_3out' in self.type:
             return torch.stack([self.decoder0(x),self.decoder1(x),self.decoder2(x)],dim=-1).squeeze()
         elif '1head_with_mask' in self.type:

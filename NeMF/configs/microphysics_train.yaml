@@ -36,6 +36,7 @@ optimizer:
   max_epochs: 100000
   lr: 1.0e-05
   wd: 1.0e-05
+  mask_wd: 5.0  # decoupled weight decay on the mask head only (weight *= 1 - lr*mask_wd per step); 0 = off
   batch_size: 1
   iter_steps: [1000000000] #[120000, 300000]
   lr_scheduler_gamma: 0.1

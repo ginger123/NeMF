@@ -113,8 +113,19 @@ def main(cfg: DictConfig):
     init_lr = cfg.optimizer.lr
 
     # Initialize the optimizer.
+    # The mask head gets its own param group without Adam's L2; its decay is applied decoupled after each step.
+    mask_wd = cfg.optimizer.get("mask_wd", 0.0)
+    mask_head = getattr(model.decoder, "mask_head", None)
+    if mask_head is not None:
+        mask_param_ids = {id(p) for p in mask_head.parameters()}
+        param_groups = [
+            {"params": list(mask_head.parameters()), "weight_decay": 0.0},
+            {"params": [p for p in model.parameters() if id(p) not in mask_param_ids]},
+        ]
+    else:
+        param_groups = model.parameters()
     optimizer = torch.optim.Adam(
-        model.parameters(),
+        param_groups,
         lr=init_lr,
         weight_decay=cfg.optimizer.wd,
     )
@@ -249,6 +260,12 @@ def main(cfg: DictConfig):
             loss.backward()
 
             optimizer.step()
+            if mask_head is not None and mask_wd > 0:
+                # Decoupled (AdamW-style) decay of the mask weights: Adam's per-parameter scaling can't weaken it.
+                # Bounds the mask logit scale, which is what grows when the mask gets overconfident.
+                with torch.no_grad():
+                    mask_head.weight.mul_(1 - optimizer.param_groups[0]["lr"] * mask_wd)
+            
             with torch.no_grad():
                 relative_err_lwc = [relative_error(ext_est=ext_est,ext_gt=ext_gt) for ext_est, ext_gt in zip(est_lwc, gt_lwc)]#torch.norm(out["output"] - out["volume"],p=1,dim=-1) / (torch.norm(out["volume"],p=1,dim=-1) + 1e-6)
                 relative_err_lwc = torch.tensor(relative_err_lwc).mean()
