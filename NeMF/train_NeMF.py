@@ -372,6 +372,17 @@ def mask_f1_per_threshold(est_mask, gt_mask, thr_vec):
     fn = (~est_bin & gt).sum(1)
     return 2 * tp / (2 * tp + fp + fn).clamp_min(1)
 
+def get_validation_criterion(cfg):
+    # 'relative_l1' is the default in test_NeMF.py's epsilon
+    val_loss_name = cfg.get("validation_loss", "relative_l1")
+    if val_loss_name == 'relative_l1':
+        val_err = relative_error
+    elif val_loss_name == 'relative_l2':
+        val_err = relative_l2
+    else:
+        raise NotImplementedError(val_loss_name)
+    return val_err
+
 def run_validation(cfg, device, model, stats, writer, val_dataloader, err_BCE, iteration, val_scatter_ind):
     use_mask = "mask" in cfg.optimizer.loss
     # Mask F1 threshold sweep, same grid as test_NeMF.py.
@@ -390,6 +401,7 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err_BCE, i
     relative_mass_err_veff = 0
     # Off by default; .get so older run configs without the key still work.
     bce_diagnostics = use_mask and cfg.get("bce_diagnostics", False)
+    val_err = get_validation_criterion(cfg)
     bce_cloud, n_bce_cloud = 0, 0
     bce_clear, n_bce_clear = 0, 0
     lwc_pos_frac = 0
@@ -459,17 +471,19 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err_BCE, i
             gt_mask = cloud.float()
             gt_height = torch.tensor(np.array(list(val_volume._grid[0][2]), dtype=np.float32), device=val_volume.device).repeat(gt_vol[0].shape[0], gt_vol[0].shape[1], 1)
             gt_height = gt_height[space_carving_mask]
-            # Clamp like test_NeMF.py: negative LWC counts as 0, so missed cloud and false cloud both count.
+            # Clamp like test_NeMF.py (all channels): negative LWC counts as 0, so missed cloud and false cloud both count.
+            # Still unsure about this - might want to punish negative values via loss
             est_lwc = est_lwc.clamp_min(0)
+            est_reff = est_reff.clamp_min(0)
+            est_veff = est_veff.clamp_min(0)
 
-            # Validation loss (selects best_val_cp): relative L2 per property, ||est-gt|| / ||gt||.
-            # The training terms MSE/||gt|| = rel_L2 * ||est-gt||/N keep the property's units and shrink with
-            # cloud size, so their sum mostly weighs the property with the largest values. These don't.
+            # Validation loss (selects best_val_cp) with the norm set by cfg.validation_loss (L1/L2).
+            # Shouldn't have any units
             # BCE is left out since the scale is different and there are worries of overfit - so we
-            # decide based on f1 score + this loss  together
-            loss_lwc = relative_l2(est_lwc, gt_lwc)
-            loss_reff = relative_l2(est_reff[cloud], gt_reff[cloud])
-            loss_veff = relative_l2(est_veff[cloud], gt_veff[cloud])
+            # decide based on f1 score + this loss together
+            loss_lwc = val_err(est_lwc, gt_lwc)
+            loss_reff = val_err(est_reff[cloud], gt_reff[cloud])
+            loss_veff = val_err(est_veff[cloud], gt_veff[cloud])
             loss_val += loss_reff + loss_lwc + loss_veff
             loss_val_lwc += loss_lwc
             loss_val_reff += loss_reff
@@ -575,7 +589,6 @@ def run_validation(cfg, device, model, stats, writer, val_dataloader, err_BCE, i
                 # Set the model back to train mode.
     model.train()
     return float(loss_val)
-
 
 if __name__ == "__main__":
     main()
